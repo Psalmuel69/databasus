@@ -22,6 +22,7 @@ import {
   CreateWorkspaceDialogComponent,
   WorkspaceSettingsComponent,
 } from '../../features/workspaces';
+import { DatabaseFleetComponent } from '../../pages/database-discovery';
 import { useIsMobile, useIsNewGitHubVersionAvailable, useScreenHeight } from '../../shared/hooks';
 import { StarButtonComponent } from '../../shared/ui/StarButtonComponent';
 import { ThemeToggleComponent } from '../../shared/ui/ThemeToggleComponent';
@@ -36,7 +37,14 @@ export const MainScreenComponent = () => {
   const contentHeight = screenHeight - (isMobile ? 70 : 95);
 
   const [selectedTab, setSelectedTab] = useState<
-    'notifiers' | 'storages' | 'databases' | 'profile' | 'databasus-settings' | 'users' | 'settings'
+    | 'notifiers'
+    | 'storages'
+    | 'databases'
+    | 'fleet'
+    | 'profile'
+    | 'databasus-settings'
+    | 'users'
+    | 'settings'
   >('databases');
   const [diskUsage, setDiskUsage] = useState<DiskUsage | undefined>(undefined);
   const [user, setUser] = useState<UserProfile | undefined>(undefined);
@@ -129,6 +137,16 @@ export const MainScreenComponent = () => {
       isAdminOnly: false,
       marginTop: '0px',
       isVisible: true,
+    },
+    {
+      text: 'Fleet',
+      name: 'fleet',
+      icon: '/icons/menu/database-gray.svg',
+      selectedIcon: '/icons/menu/database-white.svg',
+      onClick: () => setSelectedTab('fleet'),
+      isAdminOnly: false,
+      marginTop: '0px',
+      isVisible: !!selectedWorkspace,
     },
     {
       text: 'Storages',
@@ -297,6 +315,7 @@ export const MainScreenComponent = () => {
           )}
 
           {(selectedTab === 'databases' ||
+            selectedTab === 'fleet' ||
             selectedTab === 'storages' ||
             selectedTab === 'notifiers' ||
             selectedTab === 'settings') && (
@@ -342,6 +361,12 @@ export const MainScreenComponent = () => {
                         workspace={selectedWorkspace}
                         isCanManageDBs={isCanManageDBs}
                         key={`databases-${selectedWorkspace.id}`}
+                      />
+                    )}
+                    {selectedTab === 'fleet' && selectedWorkspace && (
+                      <DatabaseFleetComponent
+                        workspaceId={selectedWorkspace.id}
+                        key={`fleet-${selectedWorkspace.id}`}
                       />
                     )}
 
