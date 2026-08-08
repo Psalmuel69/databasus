@@ -1,0 +1,6 @@
+export enum DiscoveryStatus {
+  CONFIGURED = 'CONFIGURED',
+  DISCOVERED = 'DISCOVERED',
+  OFFLINE = 'OFFLINE',
+  INACCESSIBLE = 'INACCESSIBLE',
+}
