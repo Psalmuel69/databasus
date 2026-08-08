@@ -106,6 +106,10 @@ func buildDatabaseFromInstance(
 			SslClientCert: instance.SslClientCert,
 			SslClientKey:  instance.SslClientKey,
 			SslRootCert:   instance.SslRootCert,
+			// Matches the default used everywhere else a database is created
+			// (see initializeDatabaseTypeData.ts / edit forms) - adjustable
+			// afterwards from the database's edit screen.
+			CpuCount: 1,
 		}
 	case InstanceTypeMysql:
 		database.Type = databases.DatabaseTypeMysql
@@ -137,6 +141,7 @@ func buildDatabaseFromInstance(
 			Database:     databaseName,
 			AuthDatabase: instance.AuthDatabase,
 			IsSrv:        instance.IsSrv,
+			CpuCount:     1,
 		}
 	default:
 		return nil, fmt.Errorf("bulk configuration is not supported for instance type: %q", instance.Type)
