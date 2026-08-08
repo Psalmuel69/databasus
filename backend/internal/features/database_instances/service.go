@@ -11,6 +11,7 @@ import (
 
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
+	backups_config_physical "databasus-backend/internal/features/backups/config/physical"
 	"databasus-backend/internal/features/databases"
 	users_models "databasus-backend/internal/features/users/models"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
@@ -20,13 +21,14 @@ import (
 const discoveryTimeout = 60 * time.Second
 
 type DatabaseInstanceService struct {
-	instanceRepository  *DatabaseInstanceRepository
-	workspaceService    *workspaces_services.WorkspaceService
-	auditLogService     *audit_logs.AuditLogService
-	fieldEncryptor      encryption.FieldEncryptor
-	logger              *slog.Logger
-	databaseService     *databases.DatabaseService
-	backupConfigService *backups_config_logical.BackupConfigService
+	instanceRepository          *DatabaseInstanceRepository
+	workspaceService            *workspaces_services.WorkspaceService
+	auditLogService             *audit_logs.AuditLogService
+	fieldEncryptor              encryption.FieldEncryptor
+	logger                      *slog.Logger
+	databaseService             *databases.DatabaseService
+	backupConfigService         *backups_config_logical.BackupConfigService
+	physicalBackupConfigService *backups_config_physical.BackupConfigService
 }
 
 func (s *DatabaseInstanceService) RegisterInstance(

@@ -136,6 +136,7 @@ export const DatabaseFleetComponent = ({ workspaceId }: Props): JSX.Element => {
       onRefreshDiscovery={refreshDiscovery}
       workspaceId={workspaceId}
       instanceId={instance.id}
+      instanceType={instance.type}
       onEditInstance={() => setIsEditing(true)}
       onDeleteInstance={handleDeleteInstance}
     />

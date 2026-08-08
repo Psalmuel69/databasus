@@ -3,6 +3,7 @@ package database_instances
 import (
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
+	backups_config_physical "databasus-backend/internal/features/backups/config/physical"
 	"databasus-backend/internal/features/databases"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"databasus-backend/internal/util/encryption"
@@ -19,6 +20,7 @@ var databaseInstanceService = &DatabaseInstanceService{
 	logger.GetLogger(),
 	databases.GetDatabaseService(),
 	backups_config_logical.GetBackupConfigService(),
+	backups_config_physical.GetBackupConfigService(),
 }
 
 var databaseInstanceController = &DatabaseInstanceController{

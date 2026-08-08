@@ -1,14 +1,16 @@
 package database_instances
 
 import (
+	"errors"
 	"fmt"
 
-	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
 	"databasus-backend/internal/features/databases"
 	"databasus-backend/internal/features/databases/databases/mariadb"
 	"databasus-backend/internal/features/databases/databases/mongodb"
 	"databasus-backend/internal/features/databases/databases/mysql"
 	postgresql_logical "databasus-backend/internal/features/databases/databases/postgresql/logical"
+	postgresql_physical "databasus-backend/internal/features/databases/databases/postgresql/physical"
+	"databasus-backend/internal/features/notifiers"
 	users_models "databasus-backend/internal/features/users/models"
 )
 
@@ -29,9 +31,18 @@ func (s *DatabaseInstanceService) BulkConfigureBackups(
 		return nil, err
 	}
 
+	if err := validateBulkRequest(instance, request); err != nil {
+		return nil, err
+	}
+
 	configured, err := s.findConfiguredDatabases(user, instance)
 	if err != nil {
 		return nil, err
+	}
+
+	notifierStubs := make([]notifiers.Notifier, len(request.NotifierIDs))
+	for i, id := range request.NotifierIDs {
+		notifierStubs[i] = notifiers.Notifier{ID: id}
 	}
 
 	response := &BulkConfigureBackupsResponse{
@@ -46,7 +57,7 @@ func (s *DatabaseInstanceService) BulkConfigureBackups(
 			continue
 		}
 
-		if err := s.configureSingleDatabase(user, instance, name, request.BackupConfig); err != nil {
+		if err := s.configureSingleDatabase(user, instance, name, request, notifierStubs); err != nil {
 			response.Failed = append(response.Failed, BulkConfigureFailure{Name: name, Error: err.Error()})
 
 			continue
@@ -58,26 +69,68 @@ func (s *DatabaseInstanceService) BulkConfigureBackups(
 	return response, nil
 }
 
+// validateBulkRequest checks the backup-type/config pairing once, up front,
+// instead of failing every single database in the loop with the same error.
+func validateBulkRequest(instance *DatabaseInstance, request *BulkConfigureBackupsRequest) error {
+	switch request.BackupType {
+	case BulkBackupTypeLogical:
+		if request.LogicalConfig == nil {
+			return errors.New("logicalConfig is required when backupType is LOGICAL")
+		}
+
+		return nil
+	case BulkBackupTypePhysical:
+		if instance.Type != InstanceTypePostgres {
+			return fmt.Errorf(
+				"physical backups are only supported for PostgreSQL instances, not %q",
+				instance.Type,
+			)
+		}
+
+		if request.PhysicalConfig == nil {
+			return errors.New("physicalConfig is required when backupType is PHYSICAL")
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("invalid backup type: %q", request.BackupType)
+	}
+}
+
 func (s *DatabaseInstanceService) configureSingleDatabase(
 	user *users_models.User,
 	instance *DatabaseInstance,
 	databaseName string,
-	configTemplate backups_config_logical.LogicalBackupConfig,
+	request *BulkConfigureBackupsRequest,
+	notifierStubs []notifiers.Notifier,
 ) error {
-	database, err := buildDatabaseFromInstance(instance, databaseName)
+	database, err := buildDatabaseFromInstance(instance, databaseName, request.BackupType)
 	if err != nil {
 		return err
 	}
+
+	database.Notifiers = notifierStubs
 
 	created, err := s.databaseService.CreateDatabase(user, instance.WorkspaceID, database)
 	if err != nil {
 		return fmt.Errorf("failed to create database: %w", err)
 	}
 
-	configTemplate.DatabaseID = created.ID
+	switch request.BackupType {
+	case BulkBackupTypeLogical:
+		configCopy := *request.LogicalConfig
+		configCopy.DatabaseID = created.ID
 
-	if _, err := s.backupConfigService.SaveBackupConfigWithAuth(user, &configTemplate); err != nil {
-		return fmt.Errorf("failed to save backup config: %w", err)
+		if _, err := s.backupConfigService.SaveBackupConfigWithAuth(user, &configCopy); err != nil {
+			return fmt.Errorf("failed to save backup config: %w", err)
+		}
+	case BulkBackupTypePhysical:
+		configCopy := *request.PhysicalConfig
+		configCopy.DatabaseID = created.ID
+
+		if _, err := s.physicalBackupConfigService.SaveBackupConfigWithAuth(user, &configCopy); err != nil {
+			return fmt.Errorf("failed to save backup config: %w", err)
+		}
 	}
 
 	return nil
@@ -90,11 +143,33 @@ func (s *DatabaseInstanceService) configureSingleDatabase(
 func buildDatabaseFromInstance(
 	instance *DatabaseInstance,
 	databaseName string,
+	backupType BulkBackupType,
 ) (*databases.Database, error) {
 	database := &databases.Database{Name: databaseName}
 
 	switch instance.Type {
 	case InstanceTypePostgres:
+		if backupType == BulkBackupTypePhysical {
+			database.Type = databases.DatabaseTypePostgresPhysical
+			database.PostgresqlPhysical = &postgresql_physical.PostgresqlPhysicalDatabase{
+				// Version, ReplicationSlotName, SystemIdentifier and
+				// WalSegmentSizeBytes are auto-detected by
+				// DatabaseService.CreateDatabase's PopulateDbData step -
+				// same as the single-database creation path.
+				BackupType:    postgresql_physical.BackupTypeFullOnly,
+				Host:          instance.Host,
+				Port:          derefPortOrZero(instance.Port),
+				Username:      instance.Username,
+				Password:      instance.Password,
+				SslMode:       instance.SslMode,
+				SslClientCert: instance.SslClientCert,
+				SslClientKey:  instance.SslClientKey,
+				SslRootCert:   instance.SslRootCert,
+			}
+
+			break
+		}
+
 		database.Type = databases.DatabaseTypePostgresLogical
 		database.PostgresqlLogical = &postgresql_logical.PostgresqlLogicalDatabase{
 			Host:          instance.Host,

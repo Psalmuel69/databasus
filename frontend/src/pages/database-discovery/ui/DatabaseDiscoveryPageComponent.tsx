@@ -9,6 +9,7 @@ import type { DiscoveredInstance } from '../model/DiscoveredInstance';
 import { DiscoveryStatus } from '../model/DiscoveryStatus';
 import type { FleetDatabase } from '../model/FleetDatabase';
 import { generateMockFleetDatabases } from '../model/generateMockFleetDatabases';
+import type { InstanceType } from '../model/InstanceType';
 import { BulkBackupConfigModalComponent } from './BulkBackupConfigModalComponent';
 import { BulkSelectionMenuComponent } from './BulkSelectionMenuComponent';
 import { DatabaseDiscoveryStatusTag } from './DatabaseDiscoveryStatusTag';
@@ -49,6 +50,7 @@ interface Props {
   onRefreshDiscovery?: () => Promise<FleetDatabase[]>;
   workspaceId?: string;
   instanceId?: string;
+  instanceType?: InstanceType;
   onEditInstance?: () => void;
   onDeleteInstance?: () => void;
 }
@@ -59,6 +61,7 @@ export const DatabaseDiscoveryPageComponent = ({
   onRefreshDiscovery,
   workspaceId,
   instanceId,
+  instanceType,
   onEditInstance,
   onDeleteInstance,
 }: Props): JSX.Element => {
@@ -288,7 +291,7 @@ export const DatabaseDiscoveryPageComponent = ({
 
           <Button
             type="primary"
-            disabled={selectedIds.size === 0}
+            disabled={selectedIds.size === 0 || !workspaceId || !instanceId || !instanceType}
             onClick={() => setIsBulkConfigOpen(true)}
           >
             Configure backup
@@ -316,7 +319,7 @@ export const DatabaseDiscoveryPageComponent = ({
         scroll={{ y: 'calc(100vh - 320px)' }}
       />
 
-      {isBulkConfigOpen && (
+      {isBulkConfigOpen && workspaceId && instanceId && instanceType && (
         <BulkBackupConfigModalComponent
           selectedCount={selectedIds.size}
           open={isBulkConfigOpen}
@@ -324,6 +327,7 @@ export const DatabaseDiscoveryPageComponent = ({
           onConfigured={confirmBulkConfig}
           workspaceId={workspaceId}
           instanceId={instanceId}
+          instanceType={instanceType}
           selectedNames={Array.from(selectedIds)}
         />
       )}

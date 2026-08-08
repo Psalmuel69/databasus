@@ -1,7 +1,16 @@
 import type { LogicalBackupConfig } from '../../../entity/backups/logical';
+import type { PhysicalBackupConfig } from '../../../entity/backups/physical';
+import type { BulkBackupType } from './BulkBackupType';
 
 export interface BulkConfigureBackupsRequest {
   instanceId: string;
   databaseNames: string[];
-  backupConfig: Omit<LogicalBackupConfig, 'databaseId'>;
+
+  backupType: BulkBackupType;
+
+  // Exactly one of these is set, matching backupType.
+  logicalConfig?: Omit<LogicalBackupConfig, 'databaseId'>;
+  physicalConfig?: Omit<PhysicalBackupConfig, 'databaseId'>;
+
+  notifierIds: string[];
 }

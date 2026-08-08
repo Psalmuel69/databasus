@@ -1,16 +1,25 @@
-import { App, Form, Modal, Select, Switch, TimePicker } from 'antd';
-import dayjs from 'dayjs';
-import { type JSX, useEffect, useState } from 'react';
+import { InfoCircleOutlined } from '@ant-design/icons';
+import { App, Button, Modal, Radio, Tooltip } from 'antd';
+import { type JSX, useState } from 'react';
 
+import type { LogicalBackupConfig } from '../../../entity/backups/logical';
+import type { PhysicalBackupConfig } from '../../../entity/backups/physical';
 import {
-  LogicalBackupNotificationType,
-  LogicalRetentionPolicyType,
-} from '../../../entity/backups/logical';
-import { BackupEncryption } from '../../../entity/backups/shared';
-import { Period } from '../../../entity/databases';
-import { IntervalType } from '../../../entity/intervals';
-import { type Storage, storageApi } from '../../../entity/storages';
+  type Database,
+  DatabaseType,
+  PhysicalDatabaseBackupType,
+  PostgresSslMode,
+  initializeDatabaseTypeData,
+} from '../../../entity/databases';
+import type { PostgresqlPhysicalDatabase } from '../../../entity/databases/model/postgresql/physical/PostgresqlPhysicalDatabase';
+import type { Notifier } from '../../../entity/notifiers';
+import { EditLogicalBackupConfigComponent } from '../../../features/backups/logical';
+import { EditPhysicalBackupConfigComponent } from '../../../features/backups/physical';
+import { EditDatabaseNotifiersComponent } from '../../../features/databases/ui/edit/EditDatabaseNotifiersComponent';
 import { databaseInstancesApi } from '../api/databaseInstancesApi';
+import { BulkBackupType } from '../model/BulkBackupType';
+import type { BulkConfigureBackupsRequest } from '../model/BulkConfigureBackupsRequest';
+import { InstanceType } from '../model/InstanceType';
 
 interface Props {
   selectedCount: number;
@@ -18,29 +27,64 @@ interface Props {
   onClose: () => void;
   onConfigured: () => void;
 
-  // Real mode - when provided, Save calls the bulk-configure endpoint.
-  // Without them the modal stays a visual mock (standalone preview).
-  workspaceId?: string;
-  instanceId?: string;
-  selectedNames?: string[];
+  workspaceId: string;
+  instanceId: string;
+  instanceType: InstanceType;
+  selectedNames: string[];
 }
 
-interface BulkBackupFormValues {
-  intervalType: IntervalType.HOURLY | IntervalType.DAILY | IntervalType.WEEKLY;
-  timeOfDay: dayjs.Dayjs;
-  retentionTimePeriod: Period;
-  isEncryptionEnabled: boolean;
-  storageId?: string;
-}
+type WizardStep = 'backup-type' | 'backup-config' | 'notifiers';
 
-const RETENTION_OPTIONS = [
-  { value: Period.WEEK, label: '1 week' },
-  { value: Period.MONTH, label: '1 month' },
-  { value: Period.THREE_MONTH, label: '3 months' },
-  { value: Period.SIX_MONTH, label: '6 months' },
-  { value: Period.YEAR, label: '1 year' },
-  { value: Period.FOREVER, label: 'Forever' },
+const ENGINE_TO_LOGICAL_DATABASE_TYPE: Record<InstanceType, DatabaseType> = {
+  [InstanceType.POSTGRES]: DatabaseType.POSTGRES_LOGICAL,
+  [InstanceType.MYSQL]: DatabaseType.MYSQL,
+  [InstanceType.MARIADB]: DatabaseType.MARIADB,
+  [InstanceType.MONGODB]: DatabaseType.MONGODB,
+};
+
+const physicalBackupTypeOptions = [
+  {
+    label: 'Full backups only',
+    value: PhysicalDatabaseBackupType.FULL,
+    description: 'Periodic standalone full backups. Each backup is self-contained.',
+  },
+  {
+    label: 'Full + incremental',
+    value: PhysicalDatabaseBackupType.FULL_INCREMENTAL,
+    description:
+      'Full backups plus incremental ones that store only the changes since the previous backup. Smaller and faster.',
+  },
+  {
+    label: 'Full + incremental + WAL',
+    value: PhysicalDatabaseBackupType.FULL_INCREMENTAL_WAL_STREAM,
+    description:
+      'Adds continuous WAL streaming on top of full and incremental backups. Only this option enables point-in-time recovery (PITR), but it requires more space and is slower to restore.',
+  },
 ];
+
+// Drives the reused single-database editors in "wizard mode" (isSaveToApi=false) -
+// same trick CreateDatabaseComponent uses for a brand-new database. Nothing here
+// is ever persisted directly; it only exists to collect a config object.
+const buildPlaceholderDatabase = (
+  workspaceId: string,
+  databaseType: DatabaseType,
+  physicalBackupType: PhysicalDatabaseBackupType,
+): Database =>
+  initializeDatabaseTypeData({
+    id: undefined as unknown as string,
+    name: '',
+    workspaceId,
+    type: databaseType,
+    notifiers: [],
+    ...(databaseType === DatabaseType.POSTGRES_PHYSICAL
+      ? {
+          postgresqlPhysical: {
+            backupType: physicalBackupType,
+            sslMode: PostgresSslMode.Disable,
+          } as PostgresqlPhysicalDatabase,
+        }
+      : {}),
+  } as Database);
 
 export const BulkBackupConfigModalComponent = ({
   selectedCount,
@@ -49,67 +93,43 @@ export const BulkBackupConfigModalComponent = ({
   onConfigured,
   workspaceId,
   instanceId,
+  instanceType,
   selectedNames,
 }: Props): JSX.Element => {
   const { message } = App.useApp();
-  const [form] = Form.useForm<BulkBackupFormValues>();
+  const isPostgres = instanceType === InstanceType.POSTGRES;
+
+  const [step, setStep] = useState<WizardStep>(isPostgres ? 'backup-type' : 'backup-config');
+  const [isPhysical, setIsPhysical] = useState(false);
+  const [physicalBackupType, setPhysicalBackupType] = useState<PhysicalDatabaseBackupType>(
+    PhysicalDatabaseBackupType.FULL,
+  );
+  const [logicalConfig, setLogicalConfig] = useState<LogicalBackupConfig>();
+  const [physicalConfig, setPhysicalConfig] = useState<PhysicalBackupConfig>();
   const [isSaving, setIsSaving] = useState(false);
-  const [storages, setStorages] = useState<Storage[]>([]);
 
-  const isRealMode = !!instanceId && !!selectedNames && selectedNames.length > 0;
+  const databaseType = isPostgres
+    ? isPhysical
+      ? DatabaseType.POSTGRES_PHYSICAL
+      : DatabaseType.POSTGRES_LOGICAL
+    : ENGINE_TO_LOGICAL_DATABASE_TYPE[instanceType];
 
-  const loadStorages = async () => {
-    if (!workspaceId) return;
+  const placeholderDatabase = buildPlaceholderDatabase(workspaceId, databaseType, physicalBackupType);
 
-    try {
-      setStorages(await storageApi.getStorages(workspaceId));
-    } catch (error) {
-      message.error((error as Error).message || 'Failed to load storages');
-    }
-  };
-
-  const submitBulkConfig = async (values: BulkBackupFormValues) => {
+  const finalizeBulkConfig = async (notifiers: Notifier[]) => {
     setIsSaving(true);
 
-    if (!isRealMode) {
-      // Mock save for the standalone preview.
-      await new Promise((resolve) => setTimeout(resolve, 600));
-      message.success(`Backup jobs created for ${selectedCount} databases`);
-      setIsSaving(false);
-      onConfigured();
-
-      return;
-    }
-
     try {
-      const storage = storages.find((s) => s.id === values.storageId);
-
-      const response = await databaseInstancesApi.bulkConfigureBackups({
-        instanceId: instanceId,
+      const request: BulkConfigureBackupsRequest = {
+        instanceId,
         databaseNames: selectedNames,
-        backupConfig: {
-          isBackupsEnabled: true,
-          backupInterval: {
-            type: values.intervalType,
-            timeOfDay: values.timeOfDay.format('HH:mm'),
-          },
-          storage,
-          retentionPolicyType: LogicalRetentionPolicyType.TimePeriod,
-          retentionTimePeriod: values.retentionTimePeriod,
-          retentionCount: 100,
-          retentionGfsHours: 24,
-          retentionGfsDays: 7,
-          retentionGfsWeeks: 4,
-          retentionGfsMonths: 12,
-          retentionGfsYears: 3,
-          sendNotificationsOn: [LogicalBackupNotificationType.BackupFailed],
-          isRetryIfFailed: true,
-          maxFailedTriesCount: 3,
-          encryption: values.isEncryptionEnabled
-            ? BackupEncryption.ENCRYPTED
-            : BackupEncryption.NONE,
-        },
-      });
+        backupType: isPhysical ? BulkBackupType.PHYSICAL : BulkBackupType.LOGICAL,
+        logicalConfig: isPhysical ? undefined : logicalConfig,
+        physicalConfig: isPhysical ? physicalConfig : undefined,
+        notifierIds: notifiers.map((n) => n.id),
+      };
+
+      const response = await databaseInstancesApi.bulkConfigureBackups(request);
 
       const skippedNote =
         response.skipped.length > 0 ? `, ${response.skipped.length} already configured` : '';
@@ -130,77 +150,123 @@ export const BulkBackupConfigModalComponent = ({
     setIsSaving(false);
   };
 
-  useEffect(() => {
-    if (open) {
-      loadStorages();
-    }
-  }, [open, workspaceId]);
-
   return (
     <Modal
-      title={`Configure backup for ${selectedCount} selected databases`}
+      title={`Configure backup for ${selectedCount} selected database${selectedCount === 1 ? '' : 's'}`}
       open={open}
       onCancel={onClose}
-      onOk={() => form.submit()}
-      okText="Save"
-      okButtonProps={{ loading: isSaving }}
+      footer={null}
       maskClosable={false}
       destroyOnHidden
     >
-      <Form<BulkBackupFormValues>
-        form={form}
-        layout="vertical"
-        className="mt-4"
-        initialValues={{
-          intervalType: IntervalType.DAILY,
-          timeOfDay: dayjs('02:00', 'HH:mm'),
-          retentionTimePeriod: Period.THREE_MONTH,
-          isEncryptionEnabled: true,
-        }}
-        onFinish={submitBulkConfig}
-      >
-        <div className="flex gap-3">
-          <Form.Item
-            name="intervalType"
-            label="Frequency"
-            className="flex-1"
-            rules={[{ required: true }]}
+      {step === 'backup-type' && (
+        <div className="mt-3">
+          <div className="mb-2 font-medium">Backup type</div>
+
+          <Radio.Group
+            value={isPhysical ? 'PHYSICAL' : 'LOGICAL'}
+            onChange={(e) => setIsPhysical(e.target.value === 'PHYSICAL')}
+            className="mb-4 w-full"
           >
-            <Select
-              options={[
-                { value: IntervalType.HOURLY, label: 'Hourly' },
-                { value: IntervalType.DAILY, label: 'Daily' },
-                { value: IntervalType.WEEKLY, label: 'Weekly' },
-              ]}
-            />
-          </Form.Item>
+            <div className="grid grid-cols-2 gap-3">
+              <Radio.Button value="LOGICAL" className="h-auto! w-full py-2 text-center">
+                Logical
+              </Radio.Button>
+              <Radio.Button value="PHYSICAL" className="h-auto! w-full py-2 text-center">
+                Physical
+              </Radio.Button>
+            </div>
+          </Radio.Group>
 
-          <Form.Item name="timeOfDay" label="Time" className="flex-1" rules={[{ required: true }]}>
-            <TimePicker className="w-full" format="HH:mm" />
-          </Form.Item>
+          {isPhysical && (
+            <>
+              <div className="mb-2 font-medium">Physical backup strategy</div>
+
+              <Radio.Group
+                value={physicalBackupType}
+                onChange={(e) => setPhysicalBackupType(e.target.value)}
+                className="mb-2 w-full"
+              >
+                <div className="flex flex-col gap-2">
+                  {physicalBackupTypeOptions.map((option) => (
+                    <Radio key={option.value} value={option.value}>
+                      {option.label}
+                      <Tooltip title={option.description}>
+                        <InfoCircleOutlined className="ml-1 cursor-pointer" style={{ color: 'gray' }} />
+                      </Tooltip>
+                    </Radio>
+                  ))}
+                </div>
+              </Radio.Group>
+
+              <div className="mt-1 mb-4 max-w-[420px] rounded-md bg-amber-50 p-2 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                Physical backups capture the entire server, not individual databases.
+                {selectedCount > 1
+                  ? ` You've selected ${selectedCount} databases - this creates ${selectedCount} independent full-server backup jobs against the same data, each with its own replication slot and storage footprint. For most cases, selecting just one database here (representing the whole server) is what you want.`
+                  : ' This job backs up every database on the server, not just the one selected.'}
+              </div>
+            </>
+          )}
+
+          <div className="mt-5 flex">
+            <Button danger ghost className="mr-1" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="primary" className="ml-auto" onClick={() => setStep('backup-config')}>
+              Continue
+            </Button>
+          </div>
         </div>
+      )}
 
-        <Form.Item name="retentionTimePeriod" label="Retention" rules={[{ required: true }]}>
-          <Select options={RETENTION_OPTIONS} />
-        </Form.Item>
-
-        <Form.Item
-          name="storageId"
-          label="Storage"
-          rules={[{ required: isRealMode, message: 'Storage is required' }]}
-        >
-          <Select
-            placeholder={
-              storages.length > 0 ? 'Select storage' : 'No storages available in this workspace'
-            }
-            options={storages.map((storage) => ({ value: storage.id, label: storage.name }))}
+      {step === 'backup-config' &&
+        (isPhysical ? (
+          <EditPhysicalBackupConfigComponent
+            database={placeholderDatabase}
+            initialConfig={physicalConfig}
+            isShowBackButton={isPostgres}
+            onBack={() => setStep('backup-type')}
+            isShowCancelButton
+            onCancel={onClose}
+            saveButtonText="Continue"
+            isSaveToApi={false}
+            onSaved={(config) => {
+              setPhysicalConfig(config);
+              setStep('notifiers');
+            }}
           />
-        </Form.Item>
+        ) : (
+          <EditLogicalBackupConfigComponent
+            database={placeholderDatabase}
+            isShowBackButton={isPostgres}
+            onBack={() => setStep('backup-type')}
+            isShowCancelButton
+            onCancel={onClose}
+            saveButtonText="Continue"
+            isSaveToApi={false}
+            onSaved={(config) => {
+              setLogicalConfig(config);
+              setStep('notifiers');
+            }}
+          />
+        ))}
 
-        <Form.Item name="isEncryptionEnabled" label="Encryption" valuePropName="checked">
-          <Switch />
-        </Form.Item>
-      </Form>
+      {step === 'notifiers' && (
+        <EditDatabaseNotifiersComponent
+          database={placeholderDatabase}
+          workspaceId={workspaceId}
+          isShowBackButton
+          onBack={() => setStep('backup-config')}
+          isShowCancelButton
+          onCancel={onClose}
+          isShowSaveOnlyForUnsaved={false}
+          saveButtonText={
+            isSaving ? 'Applying...' : `Save & apply to ${selectedCount} database${selectedCount === 1 ? '' : 's'}`
+          }
+          isSaveToApi={false}
+          onSaved={(database) => finalizeBulkConfig(database.notifiers)}
+        />
+      )}
     </Modal>
   );
 };
