@@ -5,6 +5,7 @@ import (
 
 	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
 	backups_config_physical "databasus-backend/internal/features/backups/config/physical"
+	postgresql_physical "databasus-backend/internal/features/databases/databases/postgresql/physical"
 )
 
 // BulkBackupType selects which backup mechanism bulk-configure creates for
@@ -27,6 +28,11 @@ type BulkConfigureBackupsRequest struct {
 	// either is set per database by the server.
 	LogicalConfig  *backups_config_logical.LogicalBackupConfig   `json:"logicalConfig,omitempty"`
 	PhysicalConfig *backups_config_physical.PhysicalBackupConfig `json:"physicalConfig,omitempty"`
+
+	// Only used when BackupType is PHYSICAL - the database-level strategy
+	// (FULL / FULL_INCREMENTAL / FULL_INCREMENTAL_WAL_STREAM) that decides
+	// which retention modes PhysicalConfig may use. Defaults to FULL if empty.
+	PhysicalBackupType postgresql_physical.BackupType `json:"physicalBackupType,omitempty"`
 
 	// Notifiers attached to every created database; each config's own
 	// sendNotificationsOn list decides which events actually notify them.

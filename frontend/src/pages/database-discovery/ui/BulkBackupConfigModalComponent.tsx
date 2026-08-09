@@ -126,6 +126,7 @@ export const BulkBackupConfigModalComponent = ({
         backupType: isPhysical ? BulkBackupType.PHYSICAL : BulkBackupType.LOGICAL,
         logicalConfig: isPhysical ? undefined : logicalConfig,
         physicalConfig: isPhysical ? physicalConfig : undefined,
+        physicalBackupType: isPhysical ? physicalBackupType : undefined,
         notifierIds: notifiers.map((n) => n.id),
       };
 

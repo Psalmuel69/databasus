@@ -91,6 +91,15 @@ func validateBulkRequest(instance *DatabaseInstance, request *BulkConfigureBacku
 			return errors.New("physicalConfig is required when backupType is PHYSICAL")
 		}
 
+		switch request.PhysicalBackupType {
+		case "",
+			postgresql_physical.BackupTypeFullOnly,
+			postgresql_physical.BackupTypeFullAndIncremental,
+			postgresql_physical.BackupTypeFullIncrementalAndWalStream:
+		default:
+			return fmt.Errorf("invalid physicalBackupType: %q", request.PhysicalBackupType)
+		}
+
 		return nil
 	default:
 		return fmt.Errorf("invalid backup type: %q", request.BackupType)
@@ -104,7 +113,12 @@ func (s *DatabaseInstanceService) configureSingleDatabase(
 	request *BulkConfigureBackupsRequest,
 	notifierStubs []notifiers.Notifier,
 ) error {
-	database, err := buildDatabaseFromInstance(instance, databaseName, request.BackupType)
+	database, err := buildDatabaseFromInstance(
+		instance,
+		databaseName,
+		request.BackupType,
+		request.PhysicalBackupType,
+	)
 	if err != nil {
 		return err
 	}
@@ -144,19 +158,24 @@ func buildDatabaseFromInstance(
 	instance *DatabaseInstance,
 	databaseName string,
 	backupType BulkBackupType,
+	physicalBackupType postgresql_physical.BackupType,
 ) (*databases.Database, error) {
 	database := &databases.Database{Name: databaseName}
 
 	switch instance.Type {
 	case InstanceTypePostgres:
 		if backupType == BulkBackupTypePhysical {
+			if physicalBackupType == "" {
+				physicalBackupType = postgresql_physical.BackupTypeFullOnly
+			}
+
 			database.Type = databases.DatabaseTypePostgresPhysical
 			database.PostgresqlPhysical = &postgresql_physical.PostgresqlPhysicalDatabase{
 				// Version, ReplicationSlotName, SystemIdentifier and
 				// WalSegmentSizeBytes are auto-detected by
 				// DatabaseService.CreateDatabase's PopulateDbData step -
 				// same as the single-database creation path.
-				BackupType:    postgresql_physical.BackupTypeFullOnly,
+				BackupType:    physicalBackupType,
 				Host:          instance.Host,
 				Port:          derefPortOrZero(instance.Port),
 				Username:      instance.Username,
