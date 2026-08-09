@@ -184,7 +184,15 @@ export const BulkBackupConfigModalComponent = ({
 
               <Radio.Group
                 value={physicalBackupType}
-                onChange={(e) => setPhysicalBackupType(e.target.value)}
+                onChange={(e) => {
+                  setPhysicalBackupType(e.target.value);
+                  // Retention rules differ per backup type (e.g. FULL_ONLY
+                  // requires FULL_BACKUPS retention, no chains) - drop any
+                  // config collected for the previous strategy so the editor
+                  // recomputes defaults that actually match the new one,
+                  // instead of carrying over a now-invalid retention.
+                  setPhysicalConfig(undefined);
+                }}
                 className="mb-2 w-full"
               >
                 <div className="flex flex-col gap-2">
