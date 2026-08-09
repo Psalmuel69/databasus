@@ -47,12 +47,18 @@ func matchDatabaseToInstance(
 ) (string, bool) {
 	switch instance.Type {
 	case InstanceTypePostgres:
-		pg := database.PostgresqlLogical
-		if pg == nil || pg.Database == nil {
-			return "", false
+		if pg := database.PostgresqlLogical; pg != nil && pg.Database != nil {
+			return *pg.Database, hostPortMatches(pg.Host, &pg.Port, instance)
 		}
 
-		return *pg.Database, hostPortMatches(pg.Host, &pg.Port, instance)
+		// Physical Postgres registrations have no per-database name - they
+		// back up the whole server - so they're matched by host/port alone
+		// and reported under the parent Database row's own name.
+		if phys := database.PostgresqlPhysical; phys != nil {
+			return database.Name, hostPortMatches(phys.Host, &phys.Port, instance)
+		}
+
+		return "", false
 	case InstanceTypeMysql:
 		my := database.Mysql
 		if my == nil || my.Database == nil {
