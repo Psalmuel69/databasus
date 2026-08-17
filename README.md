@@ -93,6 +93,15 @@ Databasus performs a real restore to confirm backups are usable, not just intact
 - **Audit logs**: Track all system activities and changes made by users
 - **User roles**: Assign viewer, member, admin or owner roles within workspaces
 
+### 🚀 **Fleet Discovery**
+
+- **Register once, discover everything**: connect a database server instance (host, port, credentials) and Databasus scans it for every accessible database - no more adding databases one at a time
+- **Bulk selection**: select all, select the visible page, or filter by name pattern (`customer_*`) or minimum size, with selections preserved across search and pagination
+- **Bulk backup configuration**: apply a schedule, retention policy, storage, encryption and notifications to hundreds of databases in a single pass
+- **Logical or physical, per batch**: choose the backup type up front for PostgreSQL instances, including full-only, full + incremental, or full + incremental + WAL streaming
+- **Safe re-registration**: already-configured databases are matched by connection details and skipped automatically, so re-running discovery never creates duplicates
+- **Supported engines**: PostgreSQL, MySQL, MariaDB, MongoDB
+
 ### 🎨 **UX-Friendly**
 
 - **Designer-polished UI**: Clean, intuitive interface crafted with attention to detail
