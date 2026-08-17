@@ -11,10 +11,10 @@
   [![MongoDB](https://img.shields.io/badge/MongoDB-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
   <br />
   [![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-  [![Docker Pulls](https://img.shields.io/docker/pulls/databasus/databasus?color=brightgreen)](https://hub.docker.com/r/databasus/databasus)
-  [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/databasus/databasus)
-  [![Self Hosted](https://img.shields.io/badge/self--hosted-yes-brightgreen)](https://github.com/databasus/databasus)
-  [![Open Source](https://img.shields.io/badge/open%20source-❤️-red)](https://github.com/databasus/databasus)
+  [![Fork of databasus/databasus](https://img.shields.io/badge/fork%20of-databasus%2Fdatabasus-blue)](https://github.com/databasus/databasus)
+  [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/Psalmuel69/databasus)
+  [![Self Hosted](https://img.shields.io/badge/self--hosted-yes-brightgreen)](https://github.com/Psalmuel69/databasus)
+  [![Open Source](https://img.shields.io/badge/open%20source-❤️-red)](https://github.com/Psalmuel69/databasus)
 
   <p>
     <a href="#-features">Features</a> •
@@ -121,14 +121,9 @@ Databasus performs a real restore to confirm backups are usable, not just intact
 - **Privacy-first**: All your data stays on your infrastructure
 - **Open source**: Apache 2.0 licensed, inspect every line of code
 
-### 📦 Installation <a href="https://databasus.com/installation">(docs)</a>
+### 📦 Installation
 
-You have four ways to install Databasus:
-
-- Automated script (recommended)
-- Simple Docker run
-- Docker Compose setup
-- Kubernetes with Helm
+Build and run this fork from source with Docker Compose — see [Installation](#-installation-1) below.
 
 <img src="assets/healthchecks.svg" alt="Databasus Dashboard" width="800"/>
 
@@ -136,112 +131,27 @@ You have four ways to install Databasus:
 
 ## 📦 Installation
 
-You have four ways to install Databasus: automated script (recommended), simple Docker run, or Docker Compose setup.
+This fork adds the Fleet Discovery feature described above on top of upstream Databasus. That feature only exists in this repo's source — the prebuilt images on Docker Hub/GHCR and the upstream Helm chart are the unmodified upstream project, so **build from source** to get it.
 
-### Option 1: Automated installation script (recommended, Linux only)
-
-The installation script will:
-
-- ✅ Install Docker with Docker Compose (if not already installed)
-- ✅ Set up Databasus
-- ✅ Configure automatic startup on system reboot
+### Build and run from source (Docker Compose)
 
 ```bash
-sudo apt-get install -y curl && \
-sudo curl -sSL https://raw.githubusercontent.com/databasus/databasus/refs/heads/main/install-databasus.sh \
-| sudo bash
+git clone https://github.com/Psalmuel69/databasus.git
+cd databasus
+docker compose --profile image up -d --build databasus-local
 ```
 
-### Option 2: Simple Docker run
+This builds the image directly from this repo's `Dockerfile` (frontend + backend + verification agent, same multi-stage build the upstream release image uses) and starts it:
 
-The easiest way to run Databasus:
+- ✅ Backend on `http://localhost:4005`, with Fleet Discovery available in every workspace
+- ✅ All data persisted to `./databasus-data`
+- ✅ Restarts automatically (`unless-stopped`)
 
-```bash
-docker run -d \
-  --name databasus \
-  -p 4005:4005 \
-  -v ./databasus-data:/databasus-data \
-  --restart unless-stopped \
-  databasus/databasus:latest
-```
+Rebuild after pulling new commits with the same command — Compose picks up the change and recreates the container.
 
-_The same image lives on GitHub's registry — use `ghcr.io/databasus/databasus:latest` if Docker Hub rate-limits your pull._
+### Running the unmodified upstream project instead
 
-This single command will:
-
-- ✅ Start Databasus
-- ✅ Store all data in `./databasus-data` directory
-- ✅ Automatically restart on system reboot
-
-### Option 3: Docker Compose setup
-
-Create a `docker-compose.yml` file with the following configuration:
-
-```yaml
-services:
-  databasus:
-    container_name: databasus
-    image: databasus/databasus:latest
-    ports:
-      - "4005:4005"
-    volumes:
-      - ./databasus-data:/databasus-data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "databasus", "healthcheck"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-```
-
-Then run:
-
-```bash
-docker compose up -d
-```
-
-### Option 4: Kubernetes with Helm
-
-For Kubernetes deployments, install directly from the OCI registry.
-
-_Add `--set image.repository=ghcr.io/databasus/databasus` to any of the commands below to pull image from GHCR instead of Docker Hub._
-
-**With ClusterIP + port-forward (development/testing):**
-
-```bash
-helm install databasus oci://ghcr.io/databasus/charts/databasus \
-  -n databasus --create-namespace
-```
-
-```bash
-kubectl port-forward svc/databasus-service 4005:4005 -n databasus
-# Access at http://localhost:4005
-```
-
-**With LoadBalancer (cloud environments):**
-
-```bash
-helm install databasus oci://ghcr.io/databasus/charts/databasus \
-  -n databasus --create-namespace \
-  --set service.type=LoadBalancer
-```
-
-```bash
-kubectl get svc databasus-service -n databasus
-# Access at http://<EXTERNAL-IP>:4005
-```
-
-**With Ingress (domain-based access):**
-
-```bash
-helm install databasus oci://ghcr.io/databasus/charts/databasus \
-  -n databasus --create-namespace \
-  --set ingress.enabled=true \
-  --set ingress.hosts[0].host=backup.example.com
-```
-
-For more options (NodePort, TLS, HTTPRoute for Gateway API), see the [Helm chart README](deploy/helm/README.md).
+If you specifically want the original project without Fleet Discovery, use the prebuilt images and installer from [databasus/databasus](https://github.com/databasus/databasus#-installation) (automated script, `docker run`, plain Docker Compose, or the Helm chart) — those deploy upstream's published image, not this fork.
 
 ---
 
