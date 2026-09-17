@@ -8,13 +8,17 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/logger"
 	"databasus-backend/internal/util/walmath"
 )
 
@@ -33,11 +37,75 @@ type mockWalStorage struct {
 
 	isFailingAllSaves atomic.Bool
 
-	// Interleaves the DeleteFull cascade race: SaveFile for this exact object name
-	// signals started and waits on release before returning.
-	blockOn string
-	started chan struct{}
-	release chan struct{}
+	// Interleaves the DeleteFull cascade race: a save whose name contains this
+	// substring signals started and waits on release before returning. Object names
+	// carry a per-attempt UUID, so the test cannot know the whole name in advance.
+	blockOn   string
+	blockOnce sync.Once
+	started   chan struct{}
+	release   chan struct{}
+}
+
+// hasObjectFor reports whether any stored object belongs to the given segment.
+// A test cannot rebuild the exact key, which carries a per-attempt UUID, so it
+// matches on the segment identity the key derives from.
+func (m *mockWalStorage) hasObjectFor(databaseID uuid.UUID, timelineID int, walFilename string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	prefix := fmt.Sprintf("%s-WAL-tl%d-%s-", databaseID, timelineID, walFilename)
+
+	for name := range m.saved {
+		if strings.HasPrefix(name, prefix) && !strings.HasSuffix(name, metadataSuffix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// The uploader writes through a real Store, so the mock stands in as the provider
+// the store resolves. That keeps the obligations in the database real while the
+// bytes, the induced failures and the blocking stay under the test's control.
+func (m *mockWalStorage) GetFileWriter(context.Context, uuid.UUID) (storage_files.FileWriter, error) {
+	return m, nil
+}
+
+func (m *mockWalStorage) GetFileRemover(context.Context, uuid.UUID) (storage_files.FileRemover, error) {
+	return m, nil
+}
+
+func mockWalStoreDependencies(store *mockWalStorage) storage_files.Dependencies {
+	return storage_files.Dependencies{
+		Repository:     &storage_files.PendingDeletionRepository{},
+		Locator:        store,
+		FieldEncryptor: encryption.GetFieldEncryptor(),
+		Logger:         logger.GetLogger(),
+		Timings:        storage_files.TimingsForTest(),
+	}
+}
+
+func newMockWalStoreFor(store *mockWalStorage) *storage_files.Store {
+	return storage_files.NewStore(mockWalStoreDependencies(store))
+}
+
+// objectNamesFor returns every object the mock holds for one segment, artifact and
+// sidecar alike, so a test can name what it has to wait for.
+func (m *mockWalStorage) objectNamesFor(databaseID uuid.UUID, timelineID int, walFilename string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	prefix := fmt.Sprintf("%s-WAL-tl%d-%s-", databaseID, timelineID, walFilename)
+
+	names := make([]string, 0, 2)
+
+	for name := range m.saved {
+		if strings.HasPrefix(name, prefix) {
+			names = append(names, name)
+		}
+	}
+
+	return names
 }
 
 func newMockWalStorage() *mockWalStorage {
@@ -51,9 +119,13 @@ func (m *mockWalStorage) SaveFile(
 
 	body, _ := io.ReadAll(file)
 
-	if m.blockOn != "" && fileName == m.blockOn {
-		close(m.started)
-		<-m.release
+	// The sidecar shares the artifact's name, so the block is scoped to the
+	// artifact and fires once.
+	if m.blockOn != "" && strings.Contains(fileName, m.blockOn) && !strings.HasSuffix(fileName, metadataSuffix) {
+		m.blockOnce.Do(func() {
+			close(m.started)
+			<-m.release
+		})
 	}
 
 	if m.isFailingAllSaves.Load() {
@@ -82,7 +154,12 @@ func (m *mockWalStorage) stopFailingSaves() {
 	m.isFailingAllSaves.Store(false)
 }
 
-func (m *mockWalStorage) DeleteFile(_ encryption.FieldEncryptor, fileName string) error {
+func (m *mockWalStorage) DeleteFile(
+	_ context.Context,
+	_ encryption.FieldEncryptor,
+	_ *slog.Logger,
+	fileName string,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -92,7 +169,12 @@ func (m *mockWalStorage) DeleteFile(_ encryption.FieldEncryptor, fileName string
 	return nil
 }
 
-func (m *mockWalStorage) GetFile(_ encryption.FieldEncryptor, _ string) (io.ReadCloser, error) {
+func (m *mockWalStorage) GetFile(
+	_ context.Context,
+	_ encryption.FieldEncryptor,
+	_ *slog.Logger,
+	_ string,
+) (io.ReadCloser, error) {
 	return nil, errors.New("GetFile not implemented in mockWalStorage")
 }
 func (m *mockWalStorage) Validate(_ encryption.FieldEncryptor) error             { return nil }

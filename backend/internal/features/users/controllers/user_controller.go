@@ -2,6 +2,7 @@ package users_controllers
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -12,13 +13,14 @@ import (
 	users_errors "databasus-backend/internal/features/users/errors"
 	user_middleware "databasus-backend/internal/features/users/middleware"
 	users_services "databasus-backend/internal/features/users/services"
-	cache_utils "databasus-backend/internal/util/cache"
 	cloudflare_turnstile "databasus-backend/internal/util/cloudflare_turnstile"
+	"databasus-backend/internal/util/ratelimiter"
 )
 
 type UserController struct {
 	userService *users_services.UserService
-	rateLimiter *cache_utils.RateLimiter
+	rateLimiter ratelimiter.Counter
+	logger      *slog.Logger
 }
 
 func (c *UserController) RegisterRoutes(router *gin.RouterGroup) {
@@ -84,14 +86,16 @@ func (c *UserController) SignUp(ctx *gin.Context) {
 		}
 	}
 
-	user, err := c.userService.SignUp(&request)
+	user, err := c.userService.SignUp(ctx.Request.Context(), &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	response, err := c.userService.GenerateAccessToken(user)
+	response, err := c.userService.GenerateAccessToken(ctx.Request.Context(), user)
 	if err != nil {
+		_ = ctx.Error(err)
+
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
@@ -139,8 +143,14 @@ func (c *UserController) SignIn(ctx *gin.Context) {
 		}
 	}
 
-	allowed, _ := c.rateLimiter.CheckLimit(request.Email, "signin", 10, 1*time.Minute)
-	if !allowed {
+	isAllowed, err := c.rateLimiter.RecordAttemptAndCheckIsAllowed(
+		ctx.Request.Context(),
+		ratelimiter.Attempt{Scope: "signin", Identifier: request.Email, Limit: 10, Window: time.Minute},
+	)
+	if err != nil {
+		c.logger.ErrorContext(ctx.Request.Context(), "failed to evaluate sign-in rate limit", "error", err)
+	}
+	if err != nil || !isAllowed {
 		ctx.JSON(
 			http.StatusTooManyRequests,
 			gin.H{"error": "Rate limit exceeded. Please try again later."},
@@ -148,7 +158,7 @@ func (c *UserController) SignIn(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.userService.SignIn(&request)
+	response, err := c.userService.SignIn(ctx.Request.Context(), &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -159,7 +169,7 @@ func (c *UserController) SignIn(ctx *gin.Context) {
 
 // Admin password endpoints
 func (c *UserController) IsAdminHasPassword(ctx *gin.Context) {
-	hasPassword, err := c.userService.IsRootAdminHasPassword()
+	hasPassword, err := c.userService.IsRootAdminHasPassword(ctx.Request.Context())
 	if err != nil {
 		ctx.JSON(
 			http.StatusInternalServerError,
@@ -178,7 +188,7 @@ func (c *UserController) SetAdminPassword(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.userService.SetRootAdminPassword(request.Password); err != nil {
+	if err := c.userService.SetRootAdminPassword(ctx.Request.Context(), request.Password); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -224,7 +234,7 @@ func (c *UserController) ChangePassword(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.userService.ChangeUserPassword(user.ID, request.NewPassword); err != nil {
+	if err := c.userService.ChangeUserPassword(ctx.Request.Context(), user.ID, request.NewPassword); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -258,7 +268,7 @@ func (c *UserController) InviteUser(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.userService.InviteUser(&request, user)
+	response, err := c.userService.InviteUser(ctx.Request.Context(), &request, user)
 	if err != nil {
 		if errors.Is(err, users_errors.ErrInsufficientPermissionsToInviteUsers) {
 			ctx.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
@@ -288,7 +298,7 @@ func (c *UserController) GetCurrentUser(ctx *gin.Context) {
 		return
 	}
 
-	profile := c.userService.GetCurrentUserProfile(user)
+	profile := c.userService.GetCurrentUserProfile(ctx.Request.Context(), user)
 	ctx.JSON(http.StatusOK, profile)
 }
 
@@ -322,7 +332,7 @@ func (c *UserController) UpdateUserInfo(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.userService.UpdateUserInfo(user.ID, &request); err != nil {
+	if err := c.userService.UpdateUserInfo(ctx.Request.Context(), user.ID, &request); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -354,7 +364,7 @@ func (c *UserController) HandleGitHubOAuth(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.userService.HandleGitHubOAuth(request.Code, request.RedirectUri)
+	response, err := c.userService.HandleGitHubOAuth(ctx.Request.Context(), request.Code, request.RedirectUri)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -387,7 +397,7 @@ func (c *UserController) HandleGoogleOAuth(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.userService.HandleGoogleOAuth(request.Code, request.RedirectUri)
+	response, err := c.userService.HandleGoogleOAuth(ctx.Request.Context(), request.Code, request.RedirectUri)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -436,13 +446,19 @@ func (c *UserController) SendResetPasswordCode(ctx *gin.Context) {
 		}
 	}
 
-	allowed, _ := c.rateLimiter.CheckLimit(
-		request.Email,
-		"reset-password",
-		3,
-		1*time.Hour,
+	isAllowed, err := c.rateLimiter.RecordAttemptAndCheckIsAllowed(
+		ctx.Request.Context(),
+		ratelimiter.Attempt{
+			Scope:      "reset-password",
+			Identifier: request.Email,
+			Limit:      3,
+			Window:     time.Hour,
+		},
 	)
-	if !allowed {
+	if err != nil {
+		c.logger.ErrorContext(ctx.Request.Context(), "failed to evaluate password reset rate limit", "error", err)
+	}
+	if err != nil || !isAllowed {
 		ctx.JSON(
 			http.StatusTooManyRequests,
 			gin.H{"error": "Rate limit exceeded. Please try again later."},
@@ -450,7 +466,7 @@ func (c *UserController) SendResetPasswordCode(ctx *gin.Context) {
 		return
 	}
 
-	err := c.userService.SendResetPasswordCode(request.Email)
+	err = c.userService.SendResetPasswordCode(ctx.Request.Context(), request.Email)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -476,7 +492,7 @@ func (c *UserController) ResetPassword(ctx *gin.Context) {
 		return
 	}
 
-	err := c.userService.ResetPassword(request.Email, request.Code, request.NewPassword)
+	err := c.userService.ResetPassword(ctx.Request.Context(), request.Email, request.Code, request.NewPassword)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

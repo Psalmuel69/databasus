@@ -66,19 +66,17 @@ func Test_UploadHistoryFile_KeysRowOnParentDatabaseID(t *testing.T) {
 
 	historyRepo := physical_repositories.GetWalHistoryRepository()
 
-	row, err := UploadHistoryFile(
-		t.Context(),
-		conn,
-		timelineID,
-		newMockWalStorage(),
-		sourceDB,
-		fixture.Storage.ID,
-		historyRepo,
-		backups_core_enums.BackupEncryptionNone,
-		"",
-		encryption.GetFieldEncryptor(),
-		logger.GetLogger(),
-	)
+	row, err := UploadHistoryFile(t.Context(), HistoryUploadSpec{
+		Conn:           conn,
+		TimelineID:     timelineID,
+		FileStore:      newMockWalStoreFor(newMockWalStorage()),
+		SourceDB:       sourceDB,
+		StorageID:      fixture.Storage.ID,
+		HistoryRepo:    historyRepo,
+		Encryption:     backups_core_enums.BackupEncryptionNone,
+		FieldEncryptor: encryption.GetFieldEncryptor(),
+		Logger:         logger.GetLogger(),
+	})
 	require.NoError(t, err, "history insert must not violate fk_physical_wal_history_files_database_id")
 	require.NotNil(t, row)
 	t.Cleanup(func() { _ = historyRepo.DeleteByID(row.ID) })

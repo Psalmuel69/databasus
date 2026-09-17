@@ -2,12 +2,17 @@ package backuping_logical
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"databasus-backend/internal/config"
 	backups_core_enums "databasus-backend/internal/features/backups/backups/core/enums"
 	backups_core_logical "databasus-backend/internal/features/backups/backups/core/logical"
 	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
@@ -15,17 +20,19 @@ import (
 	"databasus-backend/internal/features/intervals"
 	"databasus-backend/internal/features/notifiers"
 	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
+	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/logger"
 	"databasus-backend/internal/util/period"
 )
 
 func Test_CleanOldBackups_DeletesBackupsOlderThanRetentionTimePeriod(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -36,11 +43,11 @@ func Test_CleanOldBackups_DeletesBackupsOlderThanRetentionTimePeriod(t *testing.
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -54,7 +61,7 @@ func Test_CleanOldBackups_DeletesBackupsOlderThanRetentionTimePeriod(t *testing.
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	now := time.Now().UTC()
@@ -91,7 +98,7 @@ func Test_CleanOldBackups_DeletesBackupsOlderThanRetentionTimePeriod(t *testing.
 	assert.NoError(t, err)
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -102,8 +109,8 @@ func Test_CleanOldBackups_DeletesBackupsOlderThanRetentionTimePeriod(t *testing.
 
 func Test_CleanOldBackups_SkipsDatabaseWithForeverRetentionPeriod(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -114,11 +121,11 @@ func Test_CleanOldBackups_SkipsDatabaseWithForeverRetentionPeriod(t *testing.T) 
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -132,7 +139,7 @@ func Test_CleanOldBackups_SkipsDatabaseWithForeverRetentionPeriod(t *testing.T) 
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	oldBackup := &backups_core_logical.LogicalBackup{
@@ -147,7 +154,7 @@ func Test_CleanOldBackups_SkipsDatabaseWithForeverRetentionPeriod(t *testing.T) 
 	assert.NoError(t, err)
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -158,8 +165,8 @@ func Test_CleanOldBackups_SkipsDatabaseWithForeverRetentionPeriod(t *testing.T) 
 
 func Test_CleanByCount_KeepsNewestNBackups_DeletesOlder(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -170,11 +177,11 @@ func Test_CleanByCount_KeepsNewestNBackups_DeletesOlder(t *testing.T) {
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -188,7 +195,7 @@ func Test_CleanByCount_KeepsNewestNBackups_DeletesOlder(t *testing.T) {
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	now := time.Now().UTC()
@@ -210,7 +217,7 @@ func Test_CleanByCount_KeepsNewestNBackups_DeletesOlder(t *testing.T) {
 	}
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -230,8 +237,8 @@ func Test_CleanByCount_KeepsNewestNBackups_DeletesOlder(t *testing.T) {
 
 func Test_CleanByCount_WhenUnderLimit_NoBackupsDeleted(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -242,11 +249,11 @@ func Test_CleanByCount_WhenUnderLimit_NoBackupsDeleted(t *testing.T) {
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -260,7 +267,7 @@ func Test_CleanByCount_WhenUnderLimit_NoBackupsDeleted(t *testing.T) {
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	for i := range 5 {
@@ -277,7 +284,7 @@ func Test_CleanByCount_WhenUnderLimit_NoBackupsDeleted(t *testing.T) {
 	}
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -287,8 +294,8 @@ func Test_CleanByCount_WhenUnderLimit_NoBackupsDeleted(t *testing.T) {
 
 func Test_CleanByCount_DoesNotDeleteInProgressBackups(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -299,11 +306,11 @@ func Test_CleanByCount_DoesNotDeleteInProgressBackups(t *testing.T) {
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -317,7 +324,7 @@ func Test_CleanByCount_DoesNotDeleteInProgressBackups(t *testing.T) {
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	now := time.Now().UTC()
@@ -347,7 +354,7 @@ func Test_CleanByCount_DoesNotDeleteInProgressBackups(t *testing.T) {
 	assert.NoError(t, err)
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -368,8 +375,8 @@ func Test_CleanByCount_DoesNotDeleteInProgressBackups(t *testing.T) {
 // the database. This prevents orphaned backup records when storage is no longer accessible.
 func Test_DeleteBackup_WhenStorageDeleteFails_BackupStillRemovedFromDatabase(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	testStorage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, testStorage, notifier)
@@ -380,11 +387,11 @@ func Test_DeleteBackup_WhenStorageDeleteFails_BackupStillRemovedFromDatabase(t *
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(testStorage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), testStorage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	backup := &backups_core_logical.LogicalBackup{
@@ -400,7 +407,7 @@ func Test_DeleteBackup_WhenStorageDeleteFails_BackupStillRemovedFromDatabase(t *
 
 	cleaner := GetBackupCleaner()
 
-	err = cleaner.DeleteBackup(backup)
+	err = cleaner.DeleteBackup(t.Context(), backup)
 	assert.NoError(t, err, "DeleteBackup should succeed even when storage file doesn't exist")
 
 	deletedBackup, err := backupRepository.FindByID(backup.ID)
@@ -410,8 +417,8 @@ func Test_DeleteBackup_WhenStorageDeleteFails_BackupStillRemovedFromDatabase(t *
 
 func Test_CleanByTimePeriod_SkipsRecentBackup_EvenIfOlderThanRetention(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -422,11 +429,11 @@ func Test_CleanByTimePeriod_SkipsRecentBackup_EvenIfOlderThanRetention(t *testin
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -442,7 +449,7 @@ func Test_CleanByTimePeriod_SkipsRecentBackup_EvenIfOlderThanRetention(t *testin
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	now := time.Now().UTC()
@@ -470,7 +477,7 @@ func Test_CleanByTimePeriod_SkipsRecentBackup_EvenIfOlderThanRetention(t *testin
 	assert.NoError(t, err)
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -481,8 +488,8 @@ func Test_CleanByTimePeriod_SkipsRecentBackup_EvenIfOlderThanRetention(t *testin
 
 func Test_CleanByCount_SkipsRecentBackup_EvenIfOverLimit(t *testing.T) {
 	router := CreateTestRouter()
-	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", owner, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -493,11 +500,11 @@ func Test_CleanByCount_SkipsRecentBackup_EvenIfOverLimit(t *testing.T) {
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	interval := createTestInterval()
@@ -513,7 +520,7 @@ func Test_CleanByCount_SkipsRecentBackup_EvenIfOverLimit(t *testing.T) {
 		BackupInterval:      interval,
 		Encryption:          backups_core_enums.BackupEncryptionEncrypted,
 	}
-	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err := backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	now := time.Now().UTC()
@@ -558,7 +565,7 @@ func Test_CleanByCount_SkipsRecentBackup_EvenIfOverLimit(t *testing.T) {
 	}
 
 	cleaner := GetBackupCleaner()
-	err = cleaner.cleanByRetentionPolicy(testLogger())
+	err = cleaner.cleanByRetentionPolicy(t.Context(), testLogger())
 	assert.NoError(t, err)
 
 	remainingBackups, err := backupRepository.FindByDatabaseID(database.ID)
@@ -603,4 +610,44 @@ func createTestInterval() intervals.Interval {
 		Type:      intervals.IntervalDaily,
 		TimeOfDay: &timeOfDay,
 	}
+}
+
+func Test_DeleteBackup_WhenProviderRefusesThenRecovers_RowGoesFirstAndFileFollows(t *testing.T) {
+	fixture := CreateBackupTestFixture(t, "Flaky Cleanup Workspace")
+	backup := SeedInProgressTestBackup(t, fixture.Database.ID, fixture.Storage.ID)
+
+	directory := "refusing-" + backup.ID.String()
+	backup.FileName = directory + "/artifact"
+	backup.Status = backups_core_logical.BackupStatusCompleted
+	require.NoError(t, backupRepository.Save(backup))
+
+	require.NoError(t, fixture.Storage.SaveFile(
+		t.Context(), encryption.GetFieldEncryptor(), logger.GetLogger(),
+		backup.FileName, strings.NewReader("stored artifact"),
+	))
+
+	absoluteDirectory := filepath.Join(config.GetEnv().DataFolder, directory)
+	require.NoError(t, os.Chmod(absoluteDirectory, 0o500))
+
+	t.Cleanup(func() {
+		_ = os.Chmod(absoluteDirectory, 0o755)
+		_ = os.RemoveAll(absoluteDirectory)
+	})
+
+	require.NoError(t, GetBackupCleaner().DeleteBackup(t.Context(), backup))
+
+	persisted, err := backupRepository.FindByID(backup.ID)
+	require.Error(t, err, "the catalog row must not wait for a provider that is refusing")
+	assert.Nil(t, persisted)
+
+	reference := storage_files.StoredFileReference{StorageID: fixture.Storage.ID, FileName: backup.FileName}
+
+	require.Error(t, storages.DrainStorageFileDeletions(t.Context(), reference),
+		"a refused deletion must stay an obligation")
+	assert.FileExists(t, filepath.Join(config.GetEnv().DataFolder, backup.FileName))
+
+	require.NoError(t, os.Chmod(absoluteDirectory, 0o755))
+
+	require.NoError(t, storages.DrainStorageFileDeletions(t.Context(), reference))
+	assert.NoFileExists(t, filepath.Join(config.GetEnv().DataFolder, backup.FileName))
 }

@@ -60,17 +60,17 @@ func createPhysicalControllerPrereqs(t *testing.T) *physicalControllerPrereqs {
 	t.Helper()
 
 	router := newPhysicalControllerRouter()
-	user := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	workspace := workspaces_testing.CreateTestWorkspace("Physical Ctrl "+uuid.NewString(), user, router)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Physical Ctrl "+uuid.NewString(), user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestPhysicalPostgresDatabase(workspace.ID, notifier, "17")
 
 	t.Cleanup(func() {
 		physical_testing.DeleteAllPhysicalCatalogForDatabase(t, database.ID)
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 	})
 
 	return &physicalControllerPrereqs{
@@ -237,7 +237,7 @@ func Test_GetBackups_Paginated_ReturnsRequestedPage(t *testing.T) {
 func Test_GetBackups_WhenNonMember_ReturnsError(t *testing.T) {
 	prereqs := createPhysicalControllerPrereqs(t)
 
-	outsider := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	outsider := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
 
 	test_utils.MakeGetRequest(t, prereqs.router,
 		"/api/v1/backups/physical/database/"+prereqs.database.ID.String()+"/backups",
@@ -441,6 +441,58 @@ func Test_GenerateRestoreToken_WhenTargetReachable_ReturnsToken(t *testing.T) {
 		"Bearer "+prereqs.user.Token,
 		backups_dto_physical.GenerateRestoreTokenRequest{TargetTime: &targetTime},
 		http.StatusOK, &response)
+
+	assert.NotEmpty(t, response.Token)
+}
+
+func Test_GenerateRestoreToken_WhenTargetDuringNewerFull_ReturnsToken(t *testing.T) {
+	prereqs := createPhysicalControllerPrereqs(t)
+	base := time.Now().UTC().Add(-2 * time.Hour)
+
+	olderFull := physical_testing.NewTestCompletedFullBackup(
+		prereqs.database.ID,
+		prereqs.storage.ID,
+		1,
+		walmath.LSN(0),
+		walmath.LSN(segmentBytes),
+	)
+	olderFull.CreatedAt = base.Add(-time.Minute)
+	olderFull.CompletedAt = ptrTime(base)
+	physical_testing.CreateTestFullBackup(t, olderFull)
+
+	newerFull := physical_testing.NewTestCompletedFullBackup(
+		prereqs.database.ID,
+		prereqs.storage.ID,
+		1,
+		walmath.LSN(2*segmentBytes),
+		walmath.LSN(2*segmentBytes+physical_testing.FullLSNSpan),
+	)
+	newerFull.CreatedAt = base.Add(5 * time.Minute)
+	newerFull.CompletedAt = ptrTime(base.Add(10 * time.Minute))
+	physical_testing.CreateTestFullBackup(t, newerFull)
+
+	for walIndex := 1; walIndex <= 3; walIndex++ {
+		walSegment := physical_testing.NewTestWalSegment(
+			prereqs.database.ID,
+			prereqs.storage.ID,
+			1,
+			"00000001000000000000000"+string(rune('0'+walIndex)),
+			walmath.LSN(walIndex*segmentBytes),
+			walmath.LSN((walIndex+1)*segmentBytes),
+		)
+		walSegment.ReceivedAt = base.Add(time.Duration(3+walIndex*2) * time.Minute)
+		physical_testing.CreateTestWalSegment(t, walSegment)
+	}
+
+	targetTime := base.Add(7 * time.Minute)
+	var response backups_dto_physical.GenerateRestoreTokenResponse
+	test_utils.MakePostRequestAndUnmarshal(t, prereqs.router,
+		"/api/v1/backups/physical/database/"+prereqs.database.ID.String()+"/restore-token",
+		"Bearer "+prereqs.user.Token,
+		backups_dto_physical.GenerateRestoreTokenRequest{TargetTime: &targetTime},
+		http.StatusOK,
+		&response,
+	)
 
 	assert.NotEmpty(t, response.Token)
 }
@@ -1041,13 +1093,13 @@ func runRolePermissionMatrix(
 ) {
 	t.Helper()
 
-	member := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	member := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
 	workspaces_testing.AddMemberToWorkspace(
 		prereqs.workspace, member, users_enums.WorkspaceRoleMember, prereqs.user.Token, prereqs.router)
 
 	viewer := addWorkspaceViewer(t, prereqs)
-	nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
-	admin := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	nonMember := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
+	admin := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 
 	viewerCode := successCode
 	if managersOnly {
@@ -1069,19 +1121,19 @@ func occupyUserStreamSlot(t *testing.T, userID uuid.UUID) {
 	t.Helper()
 
 	restoreTokenService := backups_download.GetRestoreTokenService()
-	if err := restoreTokenService.AcquireSlot(userID); err != nil {
+	if err := restoreTokenService.AcquireSlot(t.Context(), userID); err != nil {
 		t.Fatalf("occupy stream slot: %v", err)
 	}
 
 	t.Cleanup(func() {
-		restoreTokenService.ReleaseDownloadLock(userID)
+		restoreTokenService.ReleaseDownloadLock(t.Context(), userID)
 	})
 }
 
 func addWorkspaceViewer(t *testing.T, prereqs *physicalControllerPrereqs) *users_dto.SignInResponseDTO {
 	t.Helper()
 
-	viewer := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	viewer := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleMember)
 	workspaces_testing.AddMemberToWorkspace(
 		prereqs.workspace, viewer, users_enums.WorkspaceRoleViewer, prereqs.user.Token, prereqs.router)
 
@@ -1131,7 +1183,7 @@ func createSecondPhysicalDatabase(t *testing.T, prereqs *physicalControllerPrere
 	database := databases.CreateTestPhysicalPostgresDatabase(prereqs.workspace.ID, prereqs.notifier, "17")
 	t.Cleanup(func() {
 		physical_testing.DeleteAllPhysicalCatalogForDatabase(t, database.ID)
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 	})
 
 	return database
@@ -1140,7 +1192,7 @@ func createSecondPhysicalDatabase(t *testing.T, prereqs *physicalControllerPrere
 func assertAuditLogContains(t *testing.T, workspaceID uuid.UUID, messageFragment, databaseName string) {
 	t.Helper()
 
-	logs, err := audit_logs.GetAuditLogService().GetWorkspaceAuditLogs(
+	logs, err := audit_logs.GetAuditLogService().GetWorkspaceAuditLogs(t.Context(),
 		workspaceID, &audit_logs.GetAuditLogsRequest{Limit: 100, Offset: 0})
 	require.NoError(t, err)
 
@@ -1189,7 +1241,7 @@ func saveStorageObject(t *testing.T, storage *storages.Storage, name string, bod
 		t.Fatalf("save storage object %s: %v", name, err)
 	}
 
-	t.Cleanup(func() { _ = storage.DeleteFile(encryptor, name) })
+	t.Cleanup(func() { _ = storage.DeleteFile(t.Context(), encryptor, logger.GetLogger(), name) })
 }
 
 func zstdTar(t *testing.T, files map[string]string) []byte {

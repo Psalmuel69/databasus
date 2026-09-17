@@ -24,7 +24,7 @@ import (
 	pgtypes "databasus-backend/internal/features/databases/databases/postgresql/logical"
 	postgresql_shared "databasus-backend/internal/features/databases/databases/postgresql/shared"
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
-	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
@@ -63,24 +63,32 @@ func (uc *CreatePostgresqlBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	db *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(
 		completedMBs float64,
 	),
-) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info(
-		"Creating PostgreSQL backup via pg_dump custom format",
-		"databaseId",
-		db.ID,
-		"storageId",
-		storage.ID,
-	)
+) (*backups_core_logical.BackupArtifacts, error) {
+	logger := uc.logger.With("database_id", db.ID, "storage_id", backup.StorageID, "backup_id", backup.ID)
 
-	pg := db.PostgresqlLogical
+	logger.InfoContext(ctx, "creating postgresql backup via pg_dump custom format")
 
-	if pg == nil {
+	if db.PostgresqlLogical == nil {
 		return nil, fmt.Errorf("postgresql database configuration is required for pg_dump backups")
 	}
+
+	tunneledDatabase, err := databases.OpenTunnel(ctx, databases.OpenTunnelSpec{
+		Database:  db,
+		Logger:    logger,
+		Encryptor: uc.fieldEncryptor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	databaseThroughTunnel := tunneledDatabase.GetDatabaseThroughTunnel()
+	pg := databaseThroughTunnel.PostgresqlLogical
 
 	if pg.Database == nil || *pg.Database == "" {
 		return nil, fmt.Errorf("database name is required for pg_dump backups")
@@ -93,20 +101,16 @@ func (uc *CreatePostgresqlBackupUsecase) Execute(
 		return nil, fmt.Errorf("failed to decrypt database password: %w", err)
 	}
 
-	rawSizeMB, err := pg.GetRawDbSizeMb(ctx, uc.logger, uc.fieldEncryptor)
+	rawSizeMB, err := pg.GetRawDbSizeMb(ctx, logger, uc.fieldEncryptor)
 	if err != nil {
-		uc.logger.Warn("failed to fetch raw db size before backup",
-			"database_id", db.ID,
-			"error", err)
+		logger.WarnContext(ctx, "failed to fetch raw db size before backup", "error", err)
 	} else {
 		backup.BackupRawDbSizeMb = rawSizeMB
 	}
 
 	timescaledbVersion, err := pg.GetTimescaleDBVersion(ctx, uc.fieldEncryptor)
 	if err != nil {
-		uc.logger.Warn("failed to detect timescaledb extension before backup",
-			"database_id", db.ID,
-			"error", err)
+		logger.WarnContext(ctx, "failed to detect timescaledb extension before backup", "error", err)
 	} else {
 		backup.TimescaledbVersion = timescaledbVersion
 	}
@@ -118,13 +122,12 @@ func (uc *CreatePostgresqlBackupUsecase) Execute(
 		tools.GetPostgresqlExecutable(pg.Version, "pg_dump"),
 		args,
 		decryptedPassword,
-		storage,
-		db,
+		fileStore,
+		databaseThroughTunnel,
 		backupProgressListener,
 	)
 }
 
-// streamToStorage streams pg_dump output directly to storage
 func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	parentCtx context.Context,
 	backup *backups_core_logical.LogicalBackup,
@@ -132,11 +135,11 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	pgBin string,
 	args []string,
 	password string,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	db *databases.Database,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info("Streaming PostgreSQL backup to storage", "pgBin", pgBin, "args", args)
+) (*backups_core_logical.BackupArtifacts, error) {
+	uc.logger.InfoContext(parentCtx, "streaming PostgreSQL backup to storage", "pg_bin", pgBin, "args", args)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
 	defer cancel(nil)
@@ -149,12 +152,12 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	defer credentials.Remove()
 
 	cmd := exec.CommandContext(ctx, pgBin, args...)
-	uc.logger.Info("Executing PostgreSQL backup command", "command", cmd.String())
+	uc.logger.InfoContext(parentCtx, "executing PostgreSQL backup command", "command", cmd.String())
 
 	if err := uc.setupPgEnvironment(
 		cmd,
 		credentials,
-		db.PostgresqlLogical.SslMode,
+		db.PostgresqlLogical.CredentialSpec(),
 		password,
 		db.PostgresqlLogical.CpuCount,
 		pgBin,
@@ -190,23 +193,17 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	saveErrCh := make(chan error, 1)
-	go func() {
-		saveErr := storage.SaveFile(
-			ctx,
-			uc.fieldEncryptor,
-			uc.logger,
-			backup.FileName,
-			storageReader,
-		)
-		if saveErr != nil {
-			_ = storageReader.CloseWithError(saveErr)
-			cancel(saveErr)
-		}
-		saveErrCh <- saveErr
-	}()
+	fileWrite := storage_files.StartBackgroundWrite(
+		ctx,
+		fileStore,
+		storage_files.StoredFileReference{StorageID: backup.StorageID, FileName: backup.FileName},
+		storageReader,
+		cancel,
+	)
 
 	if err = cmd.Start(); err != nil {
+		uc.cleanupOnCancellation(encryptionWriter, storageWriter, fileWrite.Errors)
+
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(pgBin), err)
 	}
 
@@ -228,28 +225,28 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	waitErr := cmd.Wait()
 
 	select {
-	case earlySaveErr := <-saveErrCh:
+	case earlySaveErr := <-fileWrite.Errors:
 		if earlySaveErr != nil {
 			_ = uc.closeWriters(encryptionWriter, storageWriter)
 			return nil, fmt.Errorf("save to storage: %w", earlySaveErr)
 		}
-		saveErrCh <- nil
+		fileWrite.Errors <- nil
 	default:
 	}
 
 	select {
 	case <-ctx.Done():
-		uc.cleanupOnCancellation(encryptionWriter, storageWriter, saveErrCh)
+		uc.cleanupOnCancellation(encryptionWriter, storageWriter, fileWrite.Errors)
 		return nil, uc.classifyCancellation(ctx)
 	default:
 	}
 
 	if err := uc.closeWriters(encryptionWriter, storageWriter); err != nil {
-		<-saveErrCh
+		<-fileWrite.Errors
 		return nil, err
 	}
 
-	saveErr := <-saveErrCh
+	saveErr := <-fileWrite.Errors
 	stderrOutput := <-stderrCh
 
 	// Send final sizing after backup is completed
@@ -276,7 +273,10 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 		return nil, fmt.Errorf("save to storage: %w", saveErr)
 	}
 
-	return &backupMetadata, nil
+	return &backups_core_logical.BackupArtifacts{
+		Metadata: &backupMetadata,
+		Receipts: []storage_files.WriteReceipt{<-fileWrite.Receipts},
+	}, nil
 }
 
 func (uc *CreatePostgresqlBackupUsecase) copyWithShutdownCheck(
@@ -363,7 +363,7 @@ func (uc *CreatePostgresqlBackupUsecase) buildPgDumpArgs(pg *pgtypes.PostgresqlL
 		"-h", pg.Host,
 		"-p", strconv.Itoa(pg.Port),
 		"-U", pg.Username,
-		"-d", *pg.Database,
+		"-d", postgresql_shared.BuildDatabaseNameConninfo(*pg.Database),
 		"--verbose",
 	}
 
@@ -383,11 +383,11 @@ func (uc *CreatePostgresqlBackupUsecase) getCompressionArgs(
 	version tools.PostgresqlVersion,
 ) []string {
 	if uc.isOlderPostgresVersion(version) {
-		uc.logger.Info("Using gzip compression level 5 (zstd not available)", "version", version)
+		uc.logger.Info("using gzip compression level 5 (zstd not available)", "version", version)
 		return []string{"-Z", strconv.Itoa(compressionLevel)}
 	}
 
-	uc.logger.Info("Using zstd compression level 5", "version", version)
+	uc.logger.Info("using zstd compression level 5", "version", version)
 	return []string{fmt.Sprintf("--compress=zstd:%d", compressionLevel)}
 }
 
@@ -435,19 +435,18 @@ func (uc *CreatePostgresqlBackupUsecase) createBackupContext(
 func (uc *CreatePostgresqlBackupUsecase) setupPgEnvironment(
 	cmd *exec.Cmd,
 	credentials *postgresql_shared.CredentialTempFiles,
-	sslMode postgresql_shared.PostgresSslMode,
+	credentialSpec postgresql_shared.CredentialSpec,
 	password string,
 	cpuCount int,
 	pgBin string,
 ) error {
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, "PGPASSFILE="+credentials.PgpassPath)
+	cmd.Env = append(cmd.Env, postgresql_shared.GetPgHostAddrEnv(credentialSpec)...)
 
-	uc.logger.Info("Setting up PostgreSQL environment",
-		"passwordLength", len(password),
-		"passwordEmpty", password == "",
-		"pgBin", pgBin,
-		"parallelJobs", cpuCount,
+	uc.logger.Info("setting up PostgreSQL environment",
+		"pg_bin", pgBin,
+		"parallel_jobs", cpuCount,
 	)
 
 	cmd.Env = append(cmd.Env,
@@ -457,7 +456,7 @@ func (uc *CreatePostgresqlBackupUsecase) setupPgEnvironment(
 		"LANG=C.UTF-8",
 	)
 
-	resolvedSslMode := sslMode
+	resolvedSslMode := credentialSpec.SslMode
 	if resolvedSslMode == "" {
 		resolvedSslMode = postgresql_shared.PostgresSslModeDisable
 	}
@@ -469,7 +468,7 @@ func (uc *CreatePostgresqlBackupUsecase) setupPgEnvironment(
 		"PGSSLROOTCERT="+credentials.RootCertPath,
 		"PGSSLCRL=",
 	)
-	uc.logger.Info("Using SSL mode", "sslMode", resolvedSslMode)
+	uc.logger.Info("using SSL mode", "ssl_mode", resolvedSslMode)
 
 	if _, err := exec.LookPath(pgBin); err != nil {
 		return fmt.Errorf("PostgreSQL executable not found or not accessible: %s - %w", pgBin, err)
@@ -489,7 +488,7 @@ func (uc *CreatePostgresqlBackupUsecase) setupBackupEncryption(
 
 	if backupConfig.Encryption != backups_core_enums.BackupEncryptionEncrypted {
 		metadata.Encryption = backups_core_enums.BackupEncryptionNone
-		uc.logger.Info("Encryption disabled for backup", "backupId", backupID)
+		uc.logger.Info("encryption disabled for backup", "backup_id", backupID)
 		return storageWriter, nil, metadata, nil
 	}
 
@@ -507,14 +506,14 @@ func (uc *CreatePostgresqlBackupUsecase) setupBackupEncryption(
 	metadata.EncryptionIV = &encSetup.NonceBase64
 	metadata.Encryption = backups_core_enums.BackupEncryptionEncrypted
 
-	uc.logger.Info("Encryption enabled for backup", "backupId", backupID)
+	uc.logger.Info("encryption enabled for backup", "backup_id", backupID)
 	return encSetup.Writer, encSetup.Writer, metadata, nil
 }
 
 func (uc *CreatePostgresqlBackupUsecase) cleanupOnCancellation(
 	encryptionWriter *backup_encryption.EncryptionWriter,
 	storageWriter io.WriteCloser,
-	saveErrCh chan error,
+	writeErrors chan error,
 ) {
 	if encryptionWriter != nil {
 		go func() {
@@ -529,10 +528,10 @@ func (uc *CreatePostgresqlBackupUsecase) cleanupOnCancellation(
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer during cancellation", "error", err)
+		uc.logger.Error("failed to close pipe writer during cancellation", "error", err)
 	}
 
-	<-saveErrCh
+	<-writeErrors
 }
 
 func (uc *CreatePostgresqlBackupUsecase) closeWriters(
@@ -544,7 +543,7 @@ func (uc *CreatePostgresqlBackupUsecase) closeWriters(
 		go func() {
 			closeErr := encryptionWriter.Close()
 			if closeErr != nil {
-				uc.logger.Error("Failed to close encrypting writer", "error", closeErr)
+				uc.logger.Error("failed to close encrypting writer", "error", closeErr)
 			}
 			encryptionCloseErrCh <- closeErr
 		}()
@@ -555,13 +554,13 @@ func (uc *CreatePostgresqlBackupUsecase) closeWriters(
 	encryptionCloseErr := <-encryptionCloseErrCh
 	if encryptionCloseErr != nil {
 		if err := storageWriter.Close(); err != nil {
-			uc.logger.Error("Failed to close pipe writer after encryption error", "error", err)
+			uc.logger.Error("failed to close pipe writer after encryption error", "error", err)
 		}
 		return fmt.Errorf("failed to close encryption writer: %w", encryptionCloseErr)
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer", "error", err)
+		uc.logger.Error("failed to close pipe writer", "error", err)
 		return err
 	}
 
@@ -628,7 +627,7 @@ func (uc *CreatePostgresqlBackupUsecase) handleExitCode1NoStderr(
 	args []string,
 ) error {
 	uc.logger.Error("pg_dump failed with exit status 1 but no stderr output",
-		"pgBin", pgBin,
+		"pg_bin", pgBin,
 		"args", args,
 		"env_vars", []string{
 			"PGCLIENTENCODING=UTF8",
@@ -657,9 +656,9 @@ func (uc *CreatePostgresqlBackupUsecase) handleAccessViolation(
 	pgBin string,
 	stderrStr string,
 ) error {
-	uc.logger.Error("PostgreSQL tool crashed with access violation",
-		"pgBin", pgBin,
-		"exitCode", "0xC0000005",
+	uc.logger.Error("postgreSQL tool crashed with access violation",
+		"pg_bin", pgBin,
+		"exit_code", "0xC0000005",
 	)
 
 	return fmt.Errorf(

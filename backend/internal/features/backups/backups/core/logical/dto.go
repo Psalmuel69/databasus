@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	backups_core_enums "databasus-backend/internal/features/backups/backups/core/enums"
+	storage_files "databasus-backend/internal/features/storages/files"
 )
 
 type BackupFilters struct {
@@ -41,4 +42,11 @@ func (m *BackupMetadata) Validate() error {
 	}
 
 	return nil
+}
+
+// The receipts are what the publishing transaction spends to keep the files this
+// attempt uploaded.
+type BackupArtifacts struct {
+	Metadata *BackupMetadata
+	Receipts []storage_files.WriteReceipt
 }

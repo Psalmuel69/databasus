@@ -132,7 +132,7 @@ func Test_BackupSlot_PresentDuringRun_GoneAfterCompleted(t *testing.T) {
 
 	go func() {
 		defer close(backupDone)
-		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	}()
 
 	<-backupDone
@@ -167,7 +167,7 @@ func Test_BackupSlot_AbsentWhenTimelineCheckFails_ChainBroken(t *testing.T) {
 	fixture.DB.PostgresqlPhysical.SystemIdentifier = &wrongSysID
 	require.NoError(t, storage.GetDb().Save(fixture.DB.PostgresqlPhysical).Error)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusChainBroken, nil, 30*time.Second)
@@ -189,7 +189,7 @@ func Test_BackupSlot_OrphanFromPriorCrash_DropIfExistsRecovers(t *testing.T) {
 	require.True(t, postgresql_executor.SlotExists(t, adminConn, slotName),
 		"orphan slot must exist before backup starts")
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
@@ -245,6 +245,31 @@ func Test_RunStartupCleanup_DropsOrphanSlots(t *testing.T) {
 
 	assert.False(t, postgresql_executor.SlotExists(t, adminConn, slotName),
 		"RunStartupCleanup must drop the per-backup orphan slot")
+}
+
+// Boot cleanup gets one 5s budget per database, SSH handshake included, and a bastioned source that
+// misses it is skipped. What must not happen is missing it because the sweep never tried the tunnel
+// at all and dialled an address only the bastion can see.
+func Test_RunStartupCleanup_WhenTheSourceIsBehindABastion_DropsOrphanSlots(t *testing.T) {
+	fixture := postgresql_executor.SetupPhysicalDBForBackupBehindSshBastion(t)
+
+	slotName := postgresql_executor.SlotName(fixture.DB.PostgresqlPhysical.ID)
+	adminConn := postgresql_executor.OpenAdminConn(t, fixture)
+
+	_, err := adminConn.Exec(context.Background(),
+		"SELECT pg_create_physical_replication_slot($1, true)", slotName)
+	require.NoError(t, err, "pre-create orphan slot")
+
+	t.Cleanup(func() {
+		_, _ = adminConn.Exec(context.Background(),
+			`SELECT pg_drop_replication_slot(slot_name)
+			   FROM pg_replication_slots WHERE slot_name = $1`, slotName)
+	})
+
+	require.NoError(t, postgresql_executor.RunStartupCleanup(t.Context(), logger.GetLogger(), neverProtected))
+
+	assert.False(t, postgresql_executor.SlotExists(t, adminConn, slotName),
+		"the sweep must reach a bastioned source through the tunnel")
 }
 
 func Test_RunStartupCleanup_PreservesStreamerSlot(t *testing.T) {
@@ -311,12 +336,10 @@ func Test_RunStartupCleanup_SkipsUnreachableSource_DoesNotFail(t *testing.T) {
 		"unreachable source must be logged + skipped, not surfaced as a failure")
 }
 
-// Test_RunStartupCleanup_RecoversOrphanWhenSourceBecomesReachable covers the
-// "source DB was down" path: WithBackupSlot's defer drop reuses the same connection,
-// so when the source went down mid-backup the drop could not run and the slot was
-// left behind. The first boot still cannot reach the source (skip, slot survives);
-// the next boot after the source returns must drop the orphan. Without this, a
-// transient source outage during a backup would orphan a slot until the next backup.
+// The "source DB was down" path, where even the deferred drop's retry on a fresh connection cannot
+// get through: the slot is left behind. The first boot still cannot reach the source (skip, slot
+// survives); the next boot after the source returns must drop the orphan. Without this, an outage
+// spanning the whole backup would orphan a slot until the next one runs.
 func Test_RunStartupCleanup_RecoversOrphanWhenSourceBecomesReachable(t *testing.T) {
 	fixture := postgresql_executor.SetupPhysicalDBForBackup(t)
 
@@ -360,7 +383,7 @@ func Test_BackupSlot_PresentDuringIncrementalRun_GoneAfterFinish(t *testing.T) {
 	slotName := postgresql_executor.SlotName(fixture.DB.PostgresqlPhysical.ID)
 	adminConn := postgresql_executor.OpenAdminConn(t, fixture)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
 
@@ -389,7 +412,7 @@ func Test_BackupSlot_PresentDuringIncrementalRun_GoneAfterFinish(t *testing.T) {
 	incrID := postgresql_executor.BuildAndClaimIncremental(t, fixture, nil)
 
 	observed := postgresql_executor.RunBackupAndPoll(t, fixture, slotName, func() {
-		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(incrID, false)
+		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), incrID, false)
 	})
 
 	postgresql_executor.WaitForBackupStatus(t, incrID, physical_enums.PhysicalBackupTypeIncremental,
@@ -416,7 +439,7 @@ func Test_BackupSlot_DroppedAfterFailedIncrementalRun(t *testing.T) {
 	slotName := postgresql_executor.SlotName(fixture.DB.PostgresqlPhysical.ID)
 	adminConn := postgresql_executor.OpenAdminConn(t, fixture)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
 
@@ -455,7 +478,7 @@ func Test_BackupSlot_DroppedAfterFailedIncrementalRun(t *testing.T) {
 
 	incrID := postgresql_executor.BuildAndClaimIncremental(t, fixture, nil)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(incrID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), incrID, false)
 
 	incrRow, err := physical_repositories.GetIncrementalBackupRepository().FindByID(incrID)
 	require.NoError(t, err)
@@ -523,7 +546,7 @@ func Test_BackupSlot_HasExpectedCharacteristics(t *testing.T) {
 
 	go func() {
 		defer close(backupDone)
-		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	}()
 
 	<-backupDone
@@ -558,14 +581,14 @@ func Test_BackupSlot_ConcurrentBackupsOnDifferentDBs_NoCollision(t *testing.T) {
 	go func() {
 		defer close(doneA)
 		observedA.Store(postgresql_executor.RunBackupAndPoll(t, fixtureA, slotA, func() {
-			backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixtureA.BackupID, false)
+			backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixtureA.BackupID, false)
 		}))
 	}()
 
 	go func() {
 		defer close(doneB)
 		observedB.Store(postgresql_executor.RunBackupAndPoll(t, fixtureB, slotB, func() {
-			backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixtureB.BackupID, false)
+			backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixtureB.BackupID, false)
 		}))
 	}()
 
@@ -644,7 +667,7 @@ func Test_BackupSlot_TwoBackupsInRow_SecondReusesNameOk(t *testing.T) {
 	slotName := postgresql_executor.SlotName(fixture.DB.PostgresqlPhysical.ID)
 	adminConn := postgresql_executor.OpenAdminConn(t, fixture)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
 
@@ -679,7 +702,7 @@ func Test_BackupSlot_TwoBackupsInRow_SecondReusesNameOk(t *testing.T) {
 		_ = physical_repositories.GetInFlightBackupRepository().Release(fixture.DB.ID)
 	})
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(secondID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), secondID, false)
 	postgresql_executor.WaitForBackupStatus(t, secondID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
 
@@ -694,7 +717,7 @@ func Test_BackupSlot_PresentDuringRun_PG18(t *testing.T) {
 	adminConn := postgresql_executor.OpenAdminConn(t, fixture)
 
 	observed := postgresql_executor.RunBackupAndPoll(t, fixture, slotName, func() {
-		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	})
 
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
@@ -714,7 +737,7 @@ func Test_BackupSlot_RetryAfterFailure_ReusesName(t *testing.T) {
 
 	flakyStorage := storages.CreateTestFlakyS3Storage(*fixture.DB.WorkspaceID,
 		"http://127.0.0.1:1")
-	t.Cleanup(func() { storages.RemoveTestStorage(flakyStorage.ID) })
+	t.Cleanup(func() { storages.RemoveTestStorage(t.Context(), flakyStorage.ID) })
 
 	cfgService := backups_config_physical.GetBackupConfigService()
 	cfg, err := cfgService.GetBackupConfigByDbId(fixture.DB.ID)
@@ -722,10 +745,10 @@ func Test_BackupSlot_RetryAfterFailure_ReusesName(t *testing.T) {
 
 	cfg.StorageID = &flakyStorage.ID
 	cfg.Storage = flakyStorage
-	_, err = cfgService.SaveBackupConfig(cfg)
+	_, err = cfgService.SaveBackupConfig(t.Context(), cfg)
 	require.NoError(t, err)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 
 	finalRow, err := physical_repositories.GetFullBackupRepository().FindByID(fixture.BackupID)
 	require.NoError(t, err)
@@ -740,7 +763,7 @@ func Test_BackupSlot_RetryAfterFailure_ReusesName(t *testing.T) {
 
 	cfg.StorageID = &fixture.Storage.ID
 	cfg.Storage = fixture.Storage
-	_, err = cfgService.SaveBackupConfig(cfg)
+	_, err = cfgService.SaveBackupConfig(t.Context(), cfg)
 	require.NoError(t, err)
 
 	_ = physical_repositories.GetInFlightBackupRepository().Release(fixture.DB.ID)
@@ -772,7 +795,7 @@ func Test_BackupSlot_RetryAfterFailure_ReusesName(t *testing.T) {
 		_ = physical_repositories.GetInFlightBackupRepository().Release(fixture.DB.ID)
 	})
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(retryID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), retryID, false)
 	postgresql_executor.WaitForBackupStatus(t, retryID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
 
@@ -799,7 +822,7 @@ func Test_BackupSlot_DroppedAfterCancelledMidRun(t *testing.T) {
 
 	go func() {
 		defer close(backupDone)
-		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+		backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 	}()
 
 	go func() {
@@ -823,7 +846,7 @@ func Test_BackupSlot_DroppedAfterCancelledMidRun(t *testing.T) {
 
 			if exists {
 				slotObserved.Store(true)
-				_ = tasks_cancellation.GetTaskCancelManager().CancelTask(fixture.BackupID)
+				_ = tasks_cancellation.GetRequester().RequestCancellation(context.Background(), fixture.BackupID)
 				return
 			}
 		}
@@ -838,4 +861,35 @@ func Test_BackupSlot_DroppedAfterCancelledMidRun(t *testing.T) {
 
 	assert.False(t, postgresql_executor.SlotExists(t, adminConn, slotName),
 		"slot must be dropped after cancellation (defer uses context.Background() so it survives ctx cancel)")
+}
+
+// A bastion in front of the source makes a mid-backup connection loss routine, and the connection
+// that dies is the very one holding the slot open. Without a retry the slot survives until the next
+// backup runs, pinning WAL on the source for a whole full-backup cadence.
+func Test_WithBackupSlot_WhenTheHeldConnectionDied_DropsTheSlotOverAFreshConnection(t *testing.T) {
+	fixture := postgresql_executor.SetupPhysicalDBForBackup(t)
+
+	slotName := postgresql_executor.SlotName(fixture.DB.PostgresqlPhysical.ID)
+	adminConn := postgresql_executor.OpenAdminConn(t, fixture)
+
+	err := postgresql_executor.WithBackupSlot(
+		t.Context(),
+		fixture.DB.PostgresqlPhysical,
+		encryption.GetFieldEncryptor(),
+		logger.GetLogger(),
+		func() error {
+			require.True(t, postgresql_executor.SlotExists(t, adminConn, slotName),
+				"the slot must be held while the backup runs")
+
+			_, terminateErr := adminConn.Exec(context.Background(),
+				`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+				 WHERE datname = 'postgres' AND pid <> pg_backend_pid()`)
+
+			return terminateErr
+		},
+	)
+	require.NoError(t, err)
+
+	assert.False(t, postgresql_executor.SlotExists(t, adminConn, slotName),
+		"the deferred drop must reopen a connection rather than give up on the dead one")
 }

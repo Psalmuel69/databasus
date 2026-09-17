@@ -88,7 +88,7 @@ func (c *PhysicalBackupController) GetBackups(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.physicalBackupService.GetBackups(user, databaseID, &request)
+	response, err := c.physicalBackupService.GetBackups(ctx.Request.Context(), user, databaseID, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -130,7 +130,7 @@ func (c *PhysicalBackupController) TriggerBackup(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.requestBackupOfType(user, databaseID, request.Type); err != nil {
+	if err := c.requestBackupOfType(ctx.Request.Context(), user, databaseID, request.Type); err != nil {
 		if errors.Is(err, backups_services.ErrNoExtendableChain) {
 			ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
@@ -176,7 +176,7 @@ func (c *PhysicalBackupController) GenerateRestoreToken(ctx *gin.Context) {
 		return
 	}
 
-	token, err := c.physicalBackupService.GenerateRestoreToken(user, databaseID, &request)
+	token, err := c.physicalBackupService.GenerateRestoreToken(ctx.Request.Context(), user, databaseID, &request)
 	if err != nil {
 		if errors.Is(err, stream_guard.ErrDownloadAlreadyInProgress) {
 			ctx.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -227,7 +227,7 @@ func (c *PhysicalBackupController) GenerateBackupRestoreToken(ctx *gin.Context) 
 		return
 	}
 
-	token, err := c.physicalBackupService.GenerateBackupRestoreToken(user, backupID)
+	token, err := c.physicalBackupService.GenerateBackupRestoreToken(ctx.Request.Context(), user, backupID)
 	if err != nil {
 		if errors.Is(err, backups_services.ErrBackupNotFound) {
 			ctx.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -280,7 +280,7 @@ func (c *PhysicalBackupController) CancelBackup(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.physicalBackupService.CancelBackup(user, backupID); err != nil {
+	if err := c.physicalBackupService.CancelBackup(ctx.Request.Context(), user, backupID); err != nil {
 		if errors.Is(err, backups_services.ErrBackupNotFound) {
 			ctx.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 			return
@@ -317,7 +317,7 @@ func (c *PhysicalBackupController) DeleteBackup(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.physicalBackupService.DeleteBackup(user, backupID); err != nil {
+	if err := c.physicalBackupService.DeleteBackup(ctx.Request.Context(), user, backupID); err != nil {
 		if errors.Is(err, backups_services.ErrBackupNotFound) {
 			ctx.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 			return
@@ -349,7 +349,7 @@ func (c *PhysicalBackupController) GetRestoreStream(ctx *gin.Context) {
 		return
 	}
 
-	restoreToken, err := c.restoreTokenService.ValidateAndConsumeRestoreToken(token)
+	restoreToken, err := c.restoreTokenService.ValidateAndConsumeRestoreToken(ctx.Request.Context(), token)
 	if err != nil {
 		if errors.Is(err, stream_guard.ErrDownloadAlreadyInProgress) {
 			ctx.JSON(http.StatusConflict, gin.H{
@@ -365,7 +365,7 @@ func (c *PhysicalBackupController) GetRestoreStream(ctx *gin.Context) {
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
 	defer func() {
 		cancelHeartbeat()
-		c.restoreTokenService.ReleaseDownloadLock(restoreToken.UserID)
+		c.restoreTokenService.ReleaseDownloadLock(ctx.Request.Context(), restoreToken.UserID)
 	}()
 
 	go c.startStreamHeartbeat(heartbeatCtx, restoreToken.UserID)
@@ -374,7 +374,7 @@ func (c *PhysicalBackupController) GetRestoreStream(ctx *gin.Context) {
 	ctx.Header("Content-Disposition",
 		fmt.Sprintf(`attachment; filename="restore-%s.tar"`, restoreToken.DatabaseID))
 
-	if err := c.openRestoreStream(restoreToken, ctx.Writer); err != nil {
+	if err := c.openRestoreStream(ctx.Request.Context(), restoreToken, ctx.Writer); err != nil {
 		// Resolution runs before any bytes are written, so if nothing has been
 		// flushed yet we can still answer with a proper status. Once the tar has
 		// started, the status is already 200 and we can only log.
@@ -421,28 +421,33 @@ func classifyRestoreStreamError(err error) (int, string, bool) {
 // openRestoreStream dispatches by what the token carries: a BackupID streams a
 // per-backup restore (FULL + incremental ancestors, no WAL); otherwise
 // TargetTime drives a point-in-time restore.
-func (c *PhysicalBackupController) openRestoreStream(token *restore_token.Token, w io.Writer) error {
+func (c *PhysicalBackupController) openRestoreStream(
+	streamCtx context.Context,
+	token *restore_token.Token,
+	w io.Writer,
+) error {
 	if token.BackupID != nil {
-		return c.physicalBackupService.OpenRestoreStreamForBackup(token.DatabaseID, *token.BackupID, w)
+		return c.physicalBackupService.OpenRestoreStreamForBackup(streamCtx, token.DatabaseID, *token.BackupID, w)
 	}
 
-	return c.physicalBackupService.OpenRestoreStream(token.DatabaseID, token.TargetTime, w)
+	return c.physicalBackupService.OpenRestoreStream(streamCtx, token.DatabaseID, token.TargetTime, w)
 }
 
 func (c *PhysicalBackupController) requestBackupOfType(
+	ctx context.Context,
 	user *users_models.User,
 	databaseID uuid.UUID,
 	backupType backups_dto_physical.TriggerBackupType,
 ) error {
 	switch backupType {
 	case backups_dto_physical.TriggerBackupTypeFull:
-		return c.physicalBackupService.RequestFullBackup(user, databaseID)
+		return c.physicalBackupService.RequestFullBackup(ctx, user, databaseID)
 
 	case backups_dto_physical.TriggerBackupTypeIncremental:
-		return c.physicalBackupService.RequestIncrementalBackup(user, databaseID)
+		return c.physicalBackupService.RequestIncrementalBackup(ctx, user, databaseID)
 
 	default:
-		return c.physicalBackupService.RequestBackup(user, databaseID)
+		return c.physicalBackupService.RequestBackup(ctx, user, databaseID)
 	}
 }
 
@@ -455,7 +460,7 @@ func (c *PhysicalBackupController) startStreamHeartbeat(ctx context.Context, use
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.restoreTokenService.RefreshDownloadLock(userID)
+			c.restoreTokenService.RefreshDownloadLock(ctx, userID)
 		}
 	}
 }

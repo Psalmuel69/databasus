@@ -12,19 +12,20 @@ import (
 	"databasus-backend/internal/features/storages"
 	tasks_cancellation "databasus-backend/internal/features/tasks/cancellation"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
-	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/logger"
 )
 
 var backupRepository = &backups_core_logical.BackupRepository{}
 
-var taskCancelManager = tasks_cancellation.GetTaskCancelManager()
+var (
+	taskCancellationRegistry  = tasks_cancellation.GetRegistry()
+	taskCancellationRequester = tasks_cancellation.GetRequester()
+)
 
 var backupCleaner = &BackupCleaner{
 	backupRepository,
-	storages.GetStorageService(),
+	storages.GetStorageFileStore(),
 	backups_config_logical.GetBackupConfigService(),
-	encryption.GetFieldEncryptor(),
 	logger.GetLogger(),
 	[]backups_core_logical.BackupRemoveListener{},
 	atomic.Bool{},
@@ -32,13 +33,12 @@ var backupCleaner = &BackupCleaner{
 
 var backuper = &Backuper{
 	databases.GetDatabaseService(),
-	encryption.GetFieldEncryptor(),
 	workspaces_services.GetWorkspaceService(),
 	backupRepository,
 	backups_config_logical.GetBackupConfigService(),
-	storages.GetStorageService(),
+	storages.GetStorageFileStore(),
 	notifiers.GetNotifierService(),
-	taskCancelManager,
+	taskCancellationRegistry,
 	logger.GetLogger(),
 	usecases_logical.GetCreateBackupUsecase(),
 }
@@ -46,7 +46,7 @@ var backuper = &Backuper{
 var backupsScheduler = &BackupsScheduler{
 	backupRepository,
 	backups_config_logical.GetBackupConfigService(),
-	taskCancelManager,
+	taskCancellationRequester,
 	databases.GetDatabaseService(),
 	time.Now().UTC(),
 	logger.GetLogger(),

@@ -1,13 +1,20 @@
-import { CopyOutlined, DownOutlined, InfoCircleOutlined, UpOutlined } from '@ant-design/icons';
-import { App, Button, Checkbox, Input, InputNumber, Select, Switch, Tooltip } from 'antd';
+import { CopyOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import { App, Button, Input, InputNumber, Select, Switch, Tooltip } from 'antd';
 import { useEffect, useState } from 'react';
 
-import { type Database, databaseApi } from '../../../../entity/databases';
+import {
+  type Database,
+  databaseApi,
+  hasStoredSshTunnelSecretsForAuthType,
+  isSshTunnelReadyToTest,
+} from '../../../../entity/databases';
 import { MySqlConnectionStringParser } from '../../../../entity/databases/model/mysql/MySqlConnectionStringParser';
 import { NAME_LIST_TOKEN_SEPARATORS, normalizeNameList } from '../../../../shared/lib';
 import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
 import { ClipboardPasteModalComponent } from '../../../../shared/ui';
+import { AdvancedSettingsToggleComponent } from './AdvancedSettingsToggleComponent';
+import { EditSshTunnelComponent } from './EditSshTunnelComponent';
 
 interface Props {
   database: Database;
@@ -49,7 +56,7 @@ export const EditMySqlSpecificDataComponent = ({
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
 
   const hasAdvancedValues =
-    !!database.mysql?.isUseExtendedInsert || !!database.mysql?.excludeTables?.length;
+    !!database.mysql?.excludeTables?.length || !!database.mysql?.sshTunnel?.isEnabled;
   const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
 
   const [isShowPasteModal, setIsShowPasteModal] = useState(false);
@@ -168,16 +175,28 @@ export const EditMySqlSpecificDataComponent = ({
 
   if (!editingDatabase) return null;
 
+  const hasStoredSshSecrets = hasStoredSshTunnelSecretsForAuthType(
+    database.mysql?.sshTunnel,
+    editingDatabase.mysql?.sshTunnel?.authType,
+    database.id,
+  );
+
   let isAllFieldsFilled = true;
   if (!editingDatabase.mysql?.host) isAllFieldsFilled = false;
   if (!editingDatabase.mysql?.port) isAllFieldsFilled = false;
   if (!editingDatabase.mysql?.username) isAllFieldsFilled = false;
   if (!editingDatabase.id && !editingDatabase.mysql?.password) isAllFieldsFilled = false;
   if (!editingDatabase.mysql?.database) isAllFieldsFilled = false;
+  if (!isSshTunnelReadyToTest(editingDatabase.mysql?.sshTunnel, hasStoredSshSecrets))
+    isAllFieldsFilled = false;
 
+  // Behind a bastion a loopback address names the database as the bastion sees it, so the hint
+  // about reaching a local database would be wrong.
+  const isTunnelEnabled = !!editingDatabase.mysql?.sshTunnel?.isEnabled;
   const isLocalhostDb =
-    editingDatabase.mysql?.host?.includes('localhost') ||
-    editingDatabase.mysql?.host?.includes('127.0.0.1');
+    !isTunnelEnabled &&
+    (editingDatabase.mysql?.host?.includes('localhost') ||
+      editingDatabase.mysql?.host?.includes('127.0.0.1'));
 
   return (
     <div>
@@ -332,51 +351,26 @@ export const EditMySqlSpecificDataComponent = ({
         />
       </div>
 
-      <div className="mt-4 mb-1 flex items-center">
-        <div
-          className="flex cursor-pointer items-center text-sm text-blue-600 hover:text-blue-800"
-          onClick={() => setShowAdvanced(!isShowAdvanced)}
-        >
-          <span className="mr-2">Advanced settings</span>
-
-          {isShowAdvanced ? (
-            <UpOutlined style={{ fontSize: '12px' }} />
-          ) : (
-            <DownOutlined style={{ fontSize: '12px' }} />
-          )}
-        </div>
-      </div>
+      <AdvancedSettingsToggleComponent
+        isShowAdvanced={isShowAdvanced}
+        onToggle={() => setShowAdvanced(!isShowAdvanced)}
+      />
 
       {isShowAdvanced && (
         <>
-          <div className="mb-1 flex w-full items-center">
-            <div className="min-w-[150px]">Use extended inserts</div>
-            <div className="flex items-center">
-              <Checkbox
-                checked={editingDatabase.mysql?.isUseExtendedInsert || false}
-                onChange={(e) => {
-                  if (!editingDatabase.mysql) return;
+          <EditSshTunnelComponent
+            sshTunnel={editingDatabase.mysql?.sshTunnel}
+            hasStoredSecrets={hasStoredSshSecrets}
+            onChange={(sshTunnel) => {
+              if (!editingDatabase.mysql) return;
 
-                  setEditingDatabase({
-                    ...editingDatabase,
-                    mysql: {
-                      ...editingDatabase.mysql,
-                      isUseExtendedInsert: e.target.checked,
-                    },
-                  });
-                }}
-              >
-                Enable extended inserts
-              </Checkbox>
-
-              <Tooltip
-                className="cursor-pointer"
-                title="Batch multiple rows per INSERT for much faster restores. Off by default because it uses more memory during backup - enable only if restores are slow and your server has enough memory."
-              >
-                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
-              </Tooltip>
-            </div>
-          </div>
+              setEditingDatabase({
+                ...editingDatabase,
+                mysql: { ...editingDatabase.mysql, sshTunnel },
+              });
+              setIsConnectionTested(false);
+            }}
+          />
 
           <div className="mb-1 flex w-full items-center">
             <div className="min-w-[150px]">Exclude tables</div>

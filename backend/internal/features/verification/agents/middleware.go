@@ -7,6 +7,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"databasus-backend/internal/util/ratelimiter"
 )
 
 const (
@@ -25,7 +27,7 @@ func (s *AgentService) RequireAgentAuth() gin.HandlerFunc {
 
 		agentID, err := uuid.Parse(ctx.Param("agentId"))
 		if err != nil {
-			s.logger.Warn("verification agent auth failure",
+			s.logger.WarnContext(ctx.Request.Context(), "verification agent auth failure",
 				"client_ip", clientIP, "reason", "invalid_uuid")
 			ctx.AbortWithStatusJSON(http.StatusUnauthorized,
 				gin.H{"error": genericAuthError})
@@ -33,15 +35,25 @@ func (s *AgentService) RequireAgentAuth() gin.HandlerFunc {
 			return
 		}
 
-		isAllowed, rateLimitErr := s.rateLimiter.CheckLimit(
-			agentID.String(), rateLimitAgentEndpoint,
-			rateLimitAgentMax, rateLimitAgentWindow,
+		isAllowed, rateLimitErr := s.rateLimiter.RecordAttemptAndCheckIsAllowed(
+			ctx.Request.Context(),
+			ratelimiter.Attempt{
+				Scope:      rateLimitAgentEndpoint,
+				Identifier: agentID.String(),
+				Limit:      rateLimitAgentMax,
+				Window:     rateLimitAgentWindow,
+			},
 		)
 		if rateLimitErr != nil {
-			s.logger.Error("verification agent rate limit check failed",
-				"error", rateLimitErr, "agent_id", agentID, "client_ip", clientIP)
-		} else if !isAllowed {
-			s.logger.Warn("verification agent per-agent rate limit hit",
+			s.logger.ErrorContext(ctx.Request.Context(), "verification agent rate limit check failed",
+				"error", rateLimitErr)
+			ctx.AbortWithStatusJSON(http.StatusTooManyRequests,
+				gin.H{"error": "too many requests"})
+
+			return
+		}
+		if !isAllowed {
+			s.logger.WarnContext(ctx.Request.Context(), "verification agent per-agent rate limit hit",
 				"agent_id", agentID, "client_ip", clientIP)
 			ctx.AbortWithStatusJSON(http.StatusTooManyRequests,
 				gin.H{"error": "too many requests"})
@@ -52,7 +64,7 @@ func (s *AgentService) RequireAgentAuth() gin.HandlerFunc {
 		header := ctx.GetHeader("Authorization")
 		token := strings.TrimPrefix(header, "Bearer ")
 		if token == "" || token == header {
-			s.logger.Warn("verification agent auth failure",
+			s.logger.WarnContext(ctx.Request.Context(), "verification agent auth failure",
 				"client_ip", clientIP, "agent_id", agentID, "reason", "missing_token")
 			ctx.AbortWithStatusJSON(http.StatusUnauthorized,
 				gin.H{"error": genericAuthError})
@@ -62,7 +74,7 @@ func (s *AgentService) RequireAgentAuth() gin.HandlerFunc {
 
 		agent, err := s.VerifyAgentCredentials(agentID, token)
 		if err != nil {
-			s.logger.Warn("verification agent auth failure",
+			s.logger.WarnContext(ctx.Request.Context(), "verification agent auth failure",
 				"client_ip", clientIP, "agent_id", agentID, "reason", "invalid_credentials")
 			ctx.AbortWithStatusJSON(http.StatusUnauthorized,
 				gin.H{"error": genericAuthError})

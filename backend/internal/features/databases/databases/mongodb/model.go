@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"regexp"
-	"strings"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"gorm.io/gorm"
 
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
@@ -27,16 +28,20 @@ type MongodbDatabase struct {
 
 	Version tools.MongodbVersion `json:"version" gorm:"type:text;not null"`
 
-	Host                     string   `json:"host"               gorm:"type:text;not null"`
-	Port                     *int     `json:"port"               gorm:"type:int"`
-	Username                 string   `json:"username"           gorm:"type:text;not null"`
-	Password                 string   `json:"password"           gorm:"type:text;not null"`
-	Database                 string   `json:"database"           gorm:"type:text;not null"`
-	AuthDatabase             string   `json:"authDatabase"       gorm:"type:text;not null;default:'admin'"`
-	IsHttps                  bool     `json:"isHttps"            gorm:"type:boolean;default:false"`
-	IsSrv                    bool     `json:"isSrv"              gorm:"column:is_srv;type:boolean;not null;default:false"`
-	IsDirectConnection       bool     `json:"isDirectConnection" gorm:"column:is_direct_connection;type:boolean;not null;default:false"`
-	CpuCount                 int      `json:"cpuCount"           gorm:"column:cpu_count;type:int;not null;default:1"`
+	Host               string `json:"host"               gorm:"type:text;not null"`
+	Port               *int   `json:"port"               gorm:"type:int"`
+	Username           string `json:"username"           gorm:"type:text;not null"`
+	Password           string `json:"password"           gorm:"type:text;not null"`
+	Database           string `json:"database"           gorm:"type:text;not null"`
+	AuthDatabase       string `json:"authDatabase"       gorm:"type:text;not null;default:'admin'"`
+	IsHttps            bool   `json:"isHttps"            gorm:"type:boolean;default:false"`
+	IsSrv              bool   `json:"isSrv"              gorm:"column:is_srv;type:boolean;not null;default:false"`
+	IsDirectConnection bool   `json:"isDirectConnection" gorm:"column:is_direct_connection;type:boolean;not null;default:false"`
+	CpuCount           int    `json:"cpuCount"           gorm:"column:cpu_count;type:int;not null;default:1"`
+
+	// When the tunnel is enabled, Host and Port above address the database as the bastion sees it.
+	SshTunnel sshtunnel.Config `json:"sshTunnel" gorm:"embedded;embeddedPrefix:ssh_"`
+
 	ExcludeCollections       []string `json:"excludeCollections" gorm:"-"`
 	ExcludeCollectionsString string   `json:"-"                  gorm:"column:exclude_collections;type:text;not null;default:''"`
 }
@@ -81,7 +86,16 @@ func (m *MongodbDatabase) Validate() error {
 		return errors.New("cpu count must be greater than 0")
 	}
 
-	return nil
+	// SRV resolves its own host list from DNS and never carries a port, so there is nothing for a
+	// local forward to stand in front of.
+	if m.SshTunnel.IsEnabled && m.IsSrv {
+		return errors.New(
+			"SSH tunnel cannot be used with an SRV connection: " +
+				"SRV resolves its own host list and bypasses the forwarded port",
+		)
+	}
+
+	return m.SshTunnel.Validate()
 }
 
 func (m *MongodbDatabase) TestConnection(
@@ -101,15 +115,20 @@ func (m *MongodbDatabase) TestConnection(
 	clientOptions := options.Client().ApplyURI(uri)
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
+		// The URI carries the password, so only the database name goes into the log.
+		logger.ErrorContext(ctx, "failed to open the mongodb connection", "database_name", m.Database, "error", err)
+
 		return fmt.Errorf("failed to connect to MongoDB: %w", err)
 	}
 	defer func() {
 		if disconnectErr := client.Disconnect(ctx); disconnectErr != nil {
-			logger.Error("Failed to disconnect from MongoDB", "error", disconnectErr)
+			logger.ErrorContext(ctx, "failed to disconnect from mongodb", "error", disconnectErr)
 		}
 	}()
 
 	if err := client.Ping(ctx, nil); err != nil {
+		logger.ErrorContext(ctx, "failed to ping the mongodb database", "database_name", m.Database, "error", err)
+
 		return fmt.Errorf("failed to ping MongoDB database '%s': %w", m.Database, err)
 	}
 
@@ -119,13 +138,12 @@ func (m *MongodbDatabase) TestConnection(
 	}
 	m.Version = detectedVersion
 
-	if err := checkBackupPermissions(
-		ctx,
-		client,
-		m.Username,
-		m.Database,
-		m.AuthDatabase,
-	); err != nil {
+	if err := checkDumpReadPrivileges(ctx, client, backupPrivilegeScope{
+		Username:           m.Username,
+		Database:           m.Database,
+		AuthDatabase:       m.AuthDatabase,
+		ExcludeCollections: m.ExcludeCollections,
+	}); err != nil {
 		return err
 	}
 
@@ -157,7 +175,7 @@ func (m *MongodbDatabase) GetRawDbSizeMb(
 	}
 	defer func() {
 		if disconnectErr := client.Disconnect(ctx); disconnectErr != nil {
-			logger.Error("Failed to disconnect from MongoDB", "error", disconnectErr)
+			logger.ErrorContext(ctx, "failed to disconnect from MongoDB", "error", disconnectErr)
 		}
 	}()
 
@@ -179,6 +197,7 @@ func (m *MongodbDatabase) HideSensitiveData() {
 		return
 	}
 	m.Password = ""
+	m.SshTunnel.HideSensitiveData()
 }
 
 func (m *MongodbDatabase) Update(incoming *MongodbDatabase) {
@@ -193,10 +212,28 @@ func (m *MongodbDatabase) Update(incoming *MongodbDatabase) {
 	m.IsDirectConnection = incoming.IsDirectConnection
 	m.CpuCount = incoming.CpuCount
 	m.ExcludeCollections = incoming.ExcludeCollections
+	m.SshTunnel.Update(&incoming.SshTunnel)
 
 	if incoming.Password != "" {
 		m.Password = incoming.Password
 	}
+}
+
+func (m *MongodbDatabase) CopyForNewDatabase() *MongodbDatabase {
+	if m == nil {
+		return nil
+	}
+
+	copiedDatabase := *m
+	copiedDatabase.ID = uuid.Nil
+	copiedDatabase.DatabaseID = nil
+	copiedDatabase.ExcludeCollections = slices.Clone(m.ExcludeCollections)
+
+	if m.Port != nil {
+		copiedDatabase.Port = new(*m.Port)
+	}
+
+	return &copiedDatabase
 }
 
 func (m *MongodbDatabase) EncryptSensitiveFields(
@@ -209,7 +246,8 @@ func (m *MongodbDatabase) EncryptSensitiveFields(
 		}
 		m.Password = encrypted
 	}
-	return nil
+
+	return m.SshTunnel.EncryptSensitiveFields(encryptor)
 }
 
 func (m *MongodbDatabase) PopulateDbData(
@@ -240,7 +278,7 @@ func (m *MongodbDatabase) PopulateVersion(
 	}
 	defer func() {
 		if disconnectErr := client.Disconnect(ctx); disconnectErr != nil {
-			logger.Error("Failed to disconnect", "error", disconnectErr)
+			logger.Error("failed to disconnect", "error", disconnectErr)
 		}
 	}()
 
@@ -253,7 +291,7 @@ func (m *MongodbDatabase) PopulateVersion(
 	return nil
 }
 
-func (m *MongodbDatabase) IsUserReadOnly(
+func (m *MongodbDatabase) ShouldSuggestReadOnlyUser(
 	ctx context.Context,
 	logger *slog.Logger,
 	encryptor encryption.FieldEncryptor,
@@ -272,7 +310,7 @@ func (m *MongodbDatabase) IsUserReadOnly(
 	}
 	defer func() {
 		if disconnectErr := client.Disconnect(ctx); disconnectErr != nil {
-			logger.Error("Failed to disconnect", "error", disconnectErr)
+			logger.ErrorContext(ctx, "failed to disconnect", "error", disconnectErr)
 		}
 	}()
 
@@ -348,17 +386,17 @@ func (m *MongodbDatabase) IsUserReadOnly(
 
 	users, ok := result["users"].(bson.A)
 	if !ok || len(users) == 0 {
-		return true, detectedRoles, nil
+		return false, detectedRoles, nil
 	}
 
 	user, ok := users[0].(bson.M)
 	if !ok {
-		return true, detectedRoles, nil
+		return false, detectedRoles, nil
 	}
 
 	roles, ok := user["roles"].(bson.A)
 	if !ok {
-		return true, detectedRoles, nil
+		return false, detectedRoles, nil
 	}
 
 	// Collect all role names and check for write roles
@@ -376,7 +414,7 @@ func (m *MongodbDatabase) IsUserReadOnly(
 	// Check if any detected role is a write role
 	for _, roleName := range detectedRoles {
 		if writeRoles[roleName] {
-			return false, detectedRoles, nil
+			return true, detectedRoles, nil
 		}
 	}
 
@@ -389,7 +427,7 @@ func (m *MongodbDatabase) IsUserReadOnly(
 		}
 	}
 	if allRolesReadOnly && len(detectedRoles) > 0 {
-		return true, detectedRoles, nil
+		return false, detectedRoles, nil
 	}
 
 	// Check inherited privileges for custom roles
@@ -407,12 +445,12 @@ func (m *MongodbDatabase) IsUserReadOnly(
 
 	privUsers, ok := privResult["users"].(bson.A)
 	if !ok || len(privUsers) == 0 {
-		return true, detectedRoles, nil
+		return false, detectedRoles, nil
 	}
 
 	privUser, ok := privUsers[0].(bson.M)
 	if !ok {
-		return true, detectedRoles, nil
+		return false, detectedRoles, nil
 	}
 
 	// Check inheritedPrivileges for write actions
@@ -430,13 +468,13 @@ func (m *MongodbDatabase) IsUserReadOnly(
 			for _, action := range actions {
 				actionStr, ok := action.(string)
 				if ok && writeActions[actionStr] {
-					return false, detectedRoles, nil
+					return true, detectedRoles, nil
 				}
 			}
 		}
 	}
 
-	return true, detectedRoles, nil
+	return false, detectedRoles, nil
 }
 
 func (m *MongodbDatabase) CreateReadOnlyUser(
@@ -458,7 +496,7 @@ func (m *MongodbDatabase) CreateReadOnlyUser(
 	}
 	defer func() {
 		if disconnectErr := client.Disconnect(ctx); disconnectErr != nil {
-			logger.Error("Failed to disconnect", "error", disconnectErr)
+			logger.ErrorContext(ctx, "failed to disconnect", "error", disconnectErr)
 		}
 	}()
 
@@ -494,8 +532,9 @@ func (m *MongodbDatabase) CreateReadOnlyUser(
 			return "", "", fmt.Errorf("failed to create user: %w", err)
 		}
 
-		logger.Info(
-			"Read-only MongoDB user created successfully",
+		logger.InfoContext(
+			ctx,
+			"read-only MongoDB user created successfully",
 			"username", newUsername,
 		)
 		return newUsername, newPassword, nil
@@ -622,128 +661,6 @@ func mapMongodbVersion(major, minor string) (tools.MongodbVersion, error) {
 			major, minor,
 		)
 	}
-}
-
-// checkBackupPermissions verifies the user has sufficient privileges for mongodump backup.
-// Required: 'read' role on target database OR 'backup' role on admin OR 'readAnyDatabase' role.
-func checkBackupPermissions(
-	ctx context.Context,
-	client *mongo.Client,
-	username, database, authDatabase string,
-) error {
-	authDB := authDatabase
-	if authDB == "" {
-		authDB = "admin"
-	}
-
-	adminDB := client.Database(authDB)
-	var result bson.M
-	err := adminDB.RunCommand(ctx, bson.D{
-		{Key: "usersInfo", Value: bson.D{
-			{Key: "user", Value: username},
-			{Key: "db", Value: authDB},
-		}},
-		{Key: "showPrivileges", Value: true},
-	}).Decode(&result)
-	if err != nil {
-		return fmt.Errorf("failed to get user info: %w", err)
-	}
-
-	users, ok := result["users"].(bson.A)
-	if !ok || len(users) == 0 {
-		return errors.New("insufficient permissions for backup. User not found")
-	}
-
-	user, ok := users[0].(bson.M)
-	if !ok {
-		return errors.New("insufficient permissions for backup. Could not parse user info")
-	}
-
-	// Check roles for backup permissions
-	roles, ok := user["roles"].(bson.A)
-	if !ok {
-		return errors.New("insufficient permissions for backup. No roles assigned")
-	}
-
-	backupRoles := map[string]bool{
-		"backup":               true,
-		"root":                 true,
-		"readAnyDatabase":      true,
-		"dbOwner":              true,
-		"__system":             true,
-		"clusterAdmin":         true,
-		"readWriteAnyDatabase": true,
-	}
-
-	var userRoles []string
-	hasBackupRole := false
-	hasReadOnTargetDB := false
-
-	for _, roleDoc := range roles {
-		role, ok := roleDoc.(bson.M)
-		if !ok {
-			continue
-		}
-		roleName, _ := role["role"].(string)
-		roleDB, _ := role["db"].(string)
-
-		if roleName != "" {
-			userRoles = append(userRoles, roleName)
-		}
-
-		if backupRoles[roleName] {
-			hasBackupRole = true
-		}
-
-		if roleName == "read" && (roleDB == database || roleDB == "") {
-			hasReadOnTargetDB = true
-		}
-		if roleName == "readWrite" && (roleDB == database || roleDB == "") {
-			hasReadOnTargetDB = true
-		}
-	}
-
-	if hasBackupRole || hasReadOnTargetDB {
-		return nil
-	}
-
-	// Check inherited privileges for 'find' action on target database
-	inheritedPrivileges, ok := user["inheritedPrivileges"].(bson.A)
-	if ok {
-		for _, privDoc := range inheritedPrivileges {
-			priv, ok := privDoc.(bson.M)
-			if !ok {
-				continue
-			}
-			resource, ok := priv["resource"].(bson.M)
-			if !ok {
-				continue
-			}
-
-			resourceDB, _ := resource["db"].(string)
-			resourceCluster, _ := resource["cluster"].(bool)
-
-			isTargetDB := resourceDB == database || resourceDB == "" || resourceCluster
-
-			actions, ok := priv["actions"].(bson.A)
-			if !ok {
-				continue
-			}
-
-			for _, action := range actions {
-				actionStr, ok := action.(string)
-				if ok && actionStr == "find" && isTargetDB {
-					return nil
-				}
-			}
-		}
-	}
-
-	return fmt.Errorf(
-		"insufficient permissions for backup. Current roles: %s. Required: 'read' role on database '%s' OR 'backup' role on admin OR 'readAnyDatabase' role",
-		strings.Join(userRoles, ", "),
-		database,
-	)
 }
 
 func decryptPasswordIfNeeded(

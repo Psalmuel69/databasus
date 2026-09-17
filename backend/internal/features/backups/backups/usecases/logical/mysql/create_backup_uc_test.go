@@ -9,31 +9,21 @@ import (
 	"databasus-backend/internal/util/tools"
 )
 
-func Test_BuildMysqldumpArgs_WhenExtendedInsertDisabled_SkipsExtendedInsert(t *testing.T) {
+// One INSERT per row costs ~127x on restore and saves no memory: with --quick the
+// dumper streams rows and caps a batched statement at net_buffer_length (~1 MB)
+// however large the table is (issue #630).
+func Test_BuildMysqldumpArgs_ForAnyDatabase_NeverSkipsExtendedInsert(t *testing.T) {
 	uc := &CreateMysqlBackupUsecase{}
 	database := &mysqltypes.MysqlDatabase{
-		Version:             tools.MysqlVersion80,
-		IsUseExtendedInsert: false,
+		Version:       tools.MysqlVersion80,
+		Database:      new("oa_db"),
+		ExcludeTables: []string{"personnel_real_time"},
 	}
 
-	args := uc.buildMysqldumpArgs(database)
+	dumpArgs := uc.buildMysqldumpArgs(database)
 
-	if !slices.Contains(args, "--skip-extended-insert") {
-		t.Fatalf("expected --skip-extended-insert when extended inserts are disabled, got %v", args)
-	}
-}
-
-func Test_BuildMysqldumpArgs_WhenExtendedInsertEnabled_OmitsSkipExtendedInsert(t *testing.T) {
-	uc := &CreateMysqlBackupUsecase{}
-	database := &mysqltypes.MysqlDatabase{
-		Version:             tools.MysqlVersion80,
-		IsUseExtendedInsert: true,
-	}
-
-	args := uc.buildMysqldumpArgs(database)
-
-	if slices.Contains(args, "--skip-extended-insert") {
-		t.Fatalf("expected no --skip-extended-insert when extended inserts are enabled, got %v", args)
+	if slices.Contains(dumpArgs, "--skip-extended-insert") {
+		t.Fatalf("mysqldump args must never contain --skip-extended-insert: %v", dumpArgs)
 	}
 }
 
@@ -84,6 +74,57 @@ func Test_BuildMysqldumpArgs_WhenExcludedTablesArePastedMultiline_TrimsAndSplits
 
 	if slices.Contains(args, "--ignore-table=oa_db.") {
 		t.Fatalf("expected blank excluded tables to be dropped, got %v", args)
+	}
+}
+
+// Dumping tablespace definitions reads INFORMATION_SCHEMA.FILES, which costs a global PROCESS
+// privilege the connection test no longer requires, so the flag has to stay in every dump.
+func Test_BuildMysqldumpArgs_ForAnyDatabase_AlwaysSkipsTablespaces(t *testing.T) {
+	uc := &CreateMysqlBackupUsecase{}
+	databaseName := "oa_db"
+	database := &mysqltypes.MysqlDatabase{
+		Version:  tools.MysqlVersion80,
+		Database: &databaseName,
+	}
+
+	args := uc.buildMysqldumpArgs(database)
+
+	if !slices.Contains(args, "--no-tablespaces") {
+		t.Fatalf("expected --no-tablespaces, got %v", args)
+	}
+}
+
+func Test_BuildMysqldumpArgs_WithTriggerPrivilege_KeepsTriggers(t *testing.T) {
+	uc := &CreateMysqlBackupUsecase{}
+	databaseName := "oa_db"
+	database := &mysqltypes.MysqlDatabase{
+		Version:    tools.MysqlVersion80,
+		Database:   &databaseName,
+		Privileges: "SELECT,SHOW VIEW,TRIGGER",
+	}
+
+	args := uc.buildMysqldumpArgs(database)
+
+	if !slices.Contains(args, "--triggers") || slices.Contains(args, "--skip-triggers") {
+		t.Fatalf("expected --triggers and no --skip-triggers, got %v", args)
+	}
+}
+
+// Triggers are on by default, so without the explicit opt-out mysqldump fails on SHOW TRIGGERS
+// for a role that lacks the privilege instead of dumping without them.
+func Test_BuildMysqldumpArgs_WithoutTriggerPrivilege_SkipsTriggers(t *testing.T) {
+	uc := &CreateMysqlBackupUsecase{}
+	databaseName := "oa_db"
+	database := &mysqltypes.MysqlDatabase{
+		Version:    tools.MysqlVersion80,
+		Database:   &databaseName,
+		Privileges: "SELECT,SHOW VIEW",
+	}
+
+	args := uc.buildMysqldumpArgs(database)
+
+	if !slices.Contains(args, "--skip-triggers") || slices.Contains(args, "--triggers") {
+		t.Fatalf("expected --skip-triggers and no --triggers, got %v", args)
 	}
 }
 

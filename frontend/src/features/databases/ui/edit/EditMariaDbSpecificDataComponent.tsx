@@ -1,13 +1,20 @@
-import { CopyOutlined, DownOutlined, InfoCircleOutlined, UpOutlined } from '@ant-design/icons';
+import { CopyOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import { App, Button, Checkbox, Input, InputNumber, Select, Switch, Tooltip } from 'antd';
 import { useEffect, useState } from 'react';
 
-import { type Database, databaseApi } from '../../../../entity/databases';
+import {
+  type Database,
+  databaseApi,
+  hasStoredSshTunnelSecretsForAuthType,
+  isSshTunnelReadyToTest,
+} from '../../../../entity/databases';
 import { MariadbConnectionStringParser } from '../../../../entity/databases/model/mariadb/MariadbConnectionStringParser';
 import { NAME_LIST_TOKEN_SEPARATORS, normalizeNameList } from '../../../../shared/lib';
 import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
 import { ClipboardPasteModalComponent } from '../../../../shared/ui';
+import { AdvancedSettingsToggleComponent } from './AdvancedSettingsToggleComponent';
+import { EditSshTunnelComponent } from './EditSshTunnelComponent';
 
 interface Props {
   database: Database;
@@ -50,9 +57,9 @@ export const EditMariaDbSpecificDataComponent = ({
 
   const hasAdvancedValues =
     !!database.mariadb?.isExcludeEvents ||
-    !!database.mariadb?.isUseExtendedInsert ||
     !!database.mariadb?.isSkipGaleraDisable ||
-    !!database.mariadb?.excludeTables?.length;
+    !!database.mariadb?.excludeTables?.length ||
+    !!database.mariadb?.sshTunnel?.isEnabled;
   const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
 
   const [isShowPasteModal, setIsShowPasteModal] = useState(false);
@@ -171,6 +178,12 @@ export const EditMariaDbSpecificDataComponent = ({
 
   if (!editingDatabase) return null;
 
+  const hasStoredSshSecrets = hasStoredSshTunnelSecretsForAuthType(
+    database.mariadb?.sshTunnel,
+    editingDatabase.mariadb?.sshTunnel?.authType,
+    database.id,
+  );
+
   let isAllFieldsFilled = true;
   if (!editingDatabase.mariadb?.host) isAllFieldsFilled = false;
   if (!editingDatabase.mariadb?.port) isAllFieldsFilled = false;
@@ -178,9 +191,16 @@ export const EditMariaDbSpecificDataComponent = ({
   if (!editingDatabase.id && !editingDatabase.mariadb?.password) isAllFieldsFilled = false;
   if (!editingDatabase.mariadb?.database) isAllFieldsFilled = false;
 
+  if (!isSshTunnelReadyToTest(editingDatabase.mariadb?.sshTunnel, hasStoredSshSecrets))
+    isAllFieldsFilled = false;
+
+  // Behind a bastion a loopback address names the database as the bastion sees it, so the hint
+  // about reaching a local database would be wrong.
+  const isTunnelEnabled = !!editingDatabase.mariadb?.sshTunnel?.isEnabled;
   const isLocalhostDb =
-    editingDatabase.mariadb?.host?.includes('localhost') ||
-    editingDatabase.mariadb?.host?.includes('127.0.0.1');
+    !isTunnelEnabled &&
+    (editingDatabase.mariadb?.host?.includes('localhost') ||
+      editingDatabase.mariadb?.host?.includes('127.0.0.1'));
 
   return (
     <div>
@@ -335,23 +355,27 @@ export const EditMariaDbSpecificDataComponent = ({
         />
       </div>
 
-      <div className="mt-4 mb-1 flex items-center">
-        <div
-          className="flex cursor-pointer items-center text-sm text-blue-600 hover:text-blue-800"
-          onClick={() => setShowAdvanced(!isShowAdvanced)}
-        >
-          <span className="mr-2">Advanced settings</span>
-
-          {isShowAdvanced ? (
-            <UpOutlined style={{ fontSize: '12px' }} />
-          ) : (
-            <DownOutlined style={{ fontSize: '12px' }} />
-          )}
-        </div>
-      </div>
+      <AdvancedSettingsToggleComponent
+        isShowAdvanced={isShowAdvanced}
+        onToggle={() => setShowAdvanced(!isShowAdvanced)}
+      />
 
       {isShowAdvanced && (
         <>
+          <EditSshTunnelComponent
+            sshTunnel={editingDatabase.mariadb?.sshTunnel}
+            hasStoredSecrets={hasStoredSshSecrets}
+            onChange={(sshTunnel) => {
+              if (!editingDatabase.mariadb) return;
+
+              setEditingDatabase({
+                ...editingDatabase,
+                mariadb: { ...editingDatabase.mariadb, sshTunnel },
+              });
+              setIsConnectionTested(false);
+            }}
+          />
+
           <div className="mb-1 flex w-full items-center">
             <div className="min-w-[150px]">Exclude events</div>
             <div className="flex items-center">
@@ -375,35 +399,6 @@ export const EditMariaDbSpecificDataComponent = ({
               <Tooltip
                 className="cursor-pointer"
                 title="Skip backing up database events. Enable this if the event scheduler is disabled on your MariaDB server."
-              >
-                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
-              </Tooltip>
-            </div>
-          </div>
-
-          <div className="mb-1 flex w-full items-center">
-            <div className="min-w-[150px]">Use extended inserts</div>
-            <div className="flex items-center">
-              <Checkbox
-                checked={editingDatabase.mariadb?.isUseExtendedInsert || false}
-                onChange={(e) => {
-                  if (!editingDatabase.mariadb) return;
-
-                  setEditingDatabase({
-                    ...editingDatabase,
-                    mariadb: {
-                      ...editingDatabase.mariadb,
-                      isUseExtendedInsert: e.target.checked,
-                    },
-                  });
-                }}
-              >
-                Enable extended inserts
-              </Checkbox>
-
-              <Tooltip
-                className="cursor-pointer"
-                title="Batch multiple rows per INSERT for much faster restores. Off by default because it uses more memory during backup - enable only if restores are slow and your server has enough memory."
               >
                 <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
               </Tooltip>

@@ -184,12 +184,18 @@ func (r *barrierRestorer) StageBackupViaExec(
 }
 
 func (r *barrierRestorer) RunPgRestore(
-	_ context.Context, _ restore.ExecRunner, _ string, _ dbconn.Conn, _ int,
+	_ context.Context, _ restore.ExecRunner, _ restore.PgRestoreSpec,
 ) (restore.Result, error) {
 	r.barrier.Done()
 	r.barrier.Wait()
 
 	return restore.Result{PgRestoreExitCode: 0, DurationMs: 1}, nil
+}
+
+func (r *barrierRestorer) EnsureArchiveOwnerRoles(
+	_ context.Context, _ restore.ExecRunner, _ string, _ dbconn.Conn,
+) ([]string, error) {
+	return nil, nil
 }
 
 func (r *barrierRestorer) RunTimescalePreRestore(context.Context, dbconn.Conn) error  { return nil }

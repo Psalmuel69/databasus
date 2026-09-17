@@ -15,6 +15,7 @@ import (
 	backups_core_enums "databasus-backend/internal/features/backups/backups/core/enums"
 	physical_models "databasus-backend/internal/features/backups/backups/core/physical/models"
 	physical_repositories "databasus-backend/internal/features/backups/backups/core/physical/repositories"
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/logger"
 	"databasus-backend/internal/util/walmath"
@@ -27,10 +28,19 @@ func newTestUploader(
 	store *mockWalStorage,
 	onGap func(walmath.LSN, walmath.LSN),
 ) *WalUploader {
+	return newTestUploaderWithStore(fixture, store, newMockWalStoreFor(store), onGap)
+}
+
+func newTestUploaderWithStore(
+	fixture *PhysicalDBFixture,
+	store *mockWalStorage,
+	fileStore *storage_files.Store,
+	onGap func(walmath.LSN, walmath.LSN),
+) *WalUploader {
 	return NewWalUploader(WalUploadDeps{
 		DatabaseID:          fixture.DB.ID,
 		StorageID:           fixture.Storage.ID,
-		Storage:             store,
+		FileStore:           fileStore,
 		Encryption:          backups_core_enums.BackupEncryptionNone,
 		FieldEncryptor:      encryption.GetFieldEncryptor(),
 		WalSegmentRepo:      physical_repositories.GetWalSegmentRepository(),
@@ -71,9 +81,10 @@ func Test_WalUpload_ClaimSucceeds_SaveFileLands_FileNameUpdatedFromNullToNonNull
 	require.NotNil(t, row)
 	require.NotNil(t, row.FileName, "file_name must be flipped from NULL to the object key")
 
-	objectName := walSegmentObjectName(fixture.DB.ID, 1, name)
-	require.Equal(t, objectName, *row.FileName)
-	require.True(t, store.hasObject(objectName), "artifact must be in storage under the deterministic name")
+	// The name carries a per-attempt UUID, so the row is the only place that knows
+	// it, which is where restore reads it from too.
+	objectName := *row.FileName
+	require.True(t, store.hasObject(objectName), "artifact must be in storage under the name the row carries")
 	require.True(t, store.hasObject(objectName+metadataSuffix), "sidecar must be uploaded")
 
 	require.NoFileExists(t, localPath, "local segment must be removed after a committed upload")
@@ -209,13 +220,13 @@ func Test_WalUpload_DeleteCascadesIntoNullClaim_UploadCompletes_DeleteFileCleans
 
 	name := walName(1, 17)
 	startLSN := walmath.LSN(17 * uint64(testWalSegmentSize))
-	objectName := walSegmentObjectName(fixture.DB.ID, 1, name)
 
 	store := newMockWalStorage()
-	store.blockOn = objectName
+	walStore := newMockWalStoreFor(store)
+	store.blockOn = name
 	store.started = make(chan struct{})
 	store.release = make(chan struct{})
-	uploader := newTestUploader(fixture, store, nil)
+	uploader := newTestUploaderWithStore(fixture, store, walStore, nil)
 
 	dir := t.TempDir()
 	local := writeWalFile(t, dir, name)
@@ -236,7 +247,18 @@ func Test_WalUpload_DeleteCascadesIntoNullClaim_UploadCompletes_DeleteFileCleans
 	require.NoError(t, <-uploadErr)
 
 	require.Nil(t, findWalSegment(t, fixture.DB.ID, 1, startLSN), "cascade-deleted claim must stay gone")
-	require.False(t, store.hasObject(objectName), "orphaned ciphertext must be deleted after a lost commit")
+
+	references := make([]storage_files.StoredFileReference, 0, 2)
+	for _, objectName := range store.objectNamesFor(fixture.DB.ID, 1, name) {
+		references = append(references,
+			storage_files.StoredFileReference{StorageID: fixture.Storage.ID, FileName: objectName})
+	}
+
+	worker := storage_files.NewDeletionWorker(walStore, mockWalStoreDependencies(store))
+	require.NoError(t, worker.DrainForTest(t.Context(), references...))
+
+	require.False(t, store.hasObjectFor(fixture.DB.ID, 1, name),
+		"orphaned ciphertext must not survive a lost commit")
 	require.NoFileExists(t, local)
 }
 
@@ -351,7 +373,7 @@ func Test_WalUpload_RecoverSegment_WhenAlreadyCommitted_DropsLocalNoReupload(t *
 
 	name := walName(1, 29)
 
-	// A normal upload commits the segment (crash happened after MarkUploaded).
+	// A normal upload commits the segment (the crash landed after the commit).
 	dir1 := t.TempDir()
 	require.NoError(t, uploader.ProcessSegment(context.Background(), writeWalFile(t, dir1, name), name))
 

@@ -1,6 +1,7 @@
 package backuping_logical
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -12,11 +13,13 @@ import (
 	"databasus-backend/internal/features/databases"
 	"databasus-backend/internal/features/intervals"
 	"databasus-backend/internal/features/notifiers"
+	notifier_models "databasus-backend/internal/features/notifiers/models"
 	"databasus-backend/internal/features/storages"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
-	cache_utils "databasus-backend/internal/util/cache"
+	cache "databasus-backend/internal/util/cache"
+	"databasus-backend/internal/util/logger"
 	"databasus-backend/internal/util/period"
 	"databasus-backend/internal/util/testing/containers"
 )
@@ -56,11 +59,11 @@ func Test_RunPendingBackups_ByDatabaseType_OnlySchedulesNonAgentManagedBackups(t
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			cache_utils.ClearAllCache()
+			cache.GetStore().Clear(t.Context())
 
-			user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+			user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 			router := CreateTestRouter()
-			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+			workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 			storage := storages.CreateTestStorage(workspace.ID)
 			notifier := notifiers.CreateTestNotifier(workspace.ID)
 			database := tc.createDatabase(t, workspace.ID, storage, notifier)
@@ -71,11 +74,11 @@ func Test_RunPendingBackups_ByDatabaseType_OnlySchedulesNonAgentManagedBackups(t
 					backupRepository.DeleteByID(backup.ID)
 				}
 
-				databases.RemoveTestDatabase(database)
+				databases.RemoveTestDatabase(t.Context(), database)
 				time.Sleep(50 * time.Millisecond)
-				storages.RemoveTestStorage(storage.ID)
+				storages.RemoveTestStorage(t.Context(), storage.ID)
 				notifiers.RemoveTestNotifier(notifier)
-				workspaces_testing.RemoveTestWorkspace(workspace, router)
+				workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 			}()
 
 			backupConfig, err := backups_config_logical.GetBackupConfigService().GetBackupConfigByDbId(database.ID)
@@ -92,7 +95,7 @@ func Test_RunPendingBackups_ByDatabaseType_OnlySchedulesNonAgentManagedBackups(t
 			backupConfig.Storage = storage
 			backupConfig.StorageID = &storage.ID
 
-			_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+			_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 			assert.NoError(t, err)
 
 			// add old backup (24h ago)
@@ -103,7 +106,7 @@ func Test_RunPendingBackups_ByDatabaseType_OnlySchedulesNonAgentManagedBackups(t
 				CreatedAt:  time.Now().UTC().Add(-24 * time.Hour),
 			})
 
-			GetBackupsScheduler().runPendingBackups()
+			GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 			if tc.isBackupExpected {
 				WaitForBackupCompletion(t, database.ID, 1, 10*time.Second)
@@ -125,11 +128,11 @@ func Test_RunPendingBackups_ByDatabaseType_OnlySchedulesNonAgentManagedBackups(t
 }
 
 func Test_RunPendingBackups_WhenLastBackupWasYesterday_CreatesNewBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 	// setup data
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -141,11 +144,11 @@ func Test_RunPendingBackups_WhenLastBackupWasYesterday_CreatesNewBackup(t *testi
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups for the database
@@ -163,7 +166,7 @@ func Test_RunPendingBackups_WhenLastBackupWasYesterday_CreatesNewBackup(t *testi
 	backupConfig.Storage = storage
 	backupConfig.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	// add old backup
@@ -176,7 +179,7 @@ func Test_RunPendingBackups_WhenLastBackupWasYesterday_CreatesNewBackup(t *testi
 		CreatedAt: time.Now().UTC().Add(-24 * time.Hour),
 	})
 
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	// Wait for backup to complete (runs in goroutine)
 	WaitForBackupCompletion(t, database.ID, 1, 10*time.Second)
@@ -191,11 +194,11 @@ func Test_RunPendingBackups_WhenLastBackupWasYesterday_CreatesNewBackup(t *testi
 }
 
 func Test_RunPendingBackups_WhenLastBackupWasRecentlyCompleted_SkipsBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 	// setup data
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -207,11 +210,11 @@ func Test_RunPendingBackups_WhenLastBackupWasRecentlyCompleted_SkipsBackup(t *te
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups for the database
@@ -229,7 +232,7 @@ func Test_RunPendingBackups_WhenLastBackupWasRecentlyCompleted_SkipsBackup(t *te
 	backupConfig.Storage = storage
 	backupConfig.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	backupRepository.Save(&backups_core_logical.LogicalBackup{
@@ -241,7 +244,7 @@ func Test_RunPendingBackups_WhenLastBackupWasRecentlyCompleted_SkipsBackup(t *te
 		CreatedAt: time.Now().UTC(),
 	})
 
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -255,11 +258,11 @@ func Test_RunPendingBackups_WhenLastBackupWasRecentlyCompleted_SkipsBackup(t *te
 }
 
 func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesDisabled_SkipsBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 	// setup data
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -271,11 +274,11 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesDisabled_SkipsBackup(t
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups for the database with retries disabled
@@ -295,7 +298,7 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesDisabled_SkipsBackup(t
 	backupConfig.IsRetryIfFailed = false
 	backupConfig.MaxFailedTriesCount = 0
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	failMessage := "backup failed"
@@ -309,7 +312,7 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesDisabled_SkipsBackup(t
 		CreatedAt: time.Now().UTC(),
 	})
 
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -323,11 +326,11 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesDisabled_SkipsBackup(t
 }
 
 func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesEnabled_CreatesNewBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 	// setup data
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -339,11 +342,11 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesEnabled_CreatesNewBack
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups for the database with retries enabled
@@ -363,7 +366,7 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesEnabled_CreatesNewBack
 	backupConfig.IsRetryIfFailed = true
 	backupConfig.MaxFailedTriesCount = 3
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	// add failed backup
@@ -378,7 +381,7 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesEnabled_CreatesNewBack
 		CreatedAt: time.Now().UTC().Add(-1 * time.Hour),
 	})
 
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	// Wait for backup to complete (runs in goroutine)
 	WaitForBackupCompletion(t, database.ID, 1, 10*time.Second)
@@ -393,11 +396,11 @@ func Test_RunPendingBackups_WhenLastBackupFailedAndRetriesEnabled_CreatesNewBack
 }
 
 func Test_RunPendingBackups_WhenFailedBackupsExceedMaxRetries_SkipsBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 	// setup data
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -409,11 +412,11 @@ func Test_RunPendingBackups_WhenFailedBackupsExceedMaxRetries_SkipsBackup(t *tes
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups for the database with retries enabled
@@ -433,7 +436,7 @@ func Test_RunPendingBackups_WhenFailedBackupsExceedMaxRetries_SkipsBackup(t *tes
 	backupConfig.IsRetryIfFailed = true
 	backupConfig.MaxFailedTriesCount = 3
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	failMessage := "backup failed"
@@ -450,7 +453,7 @@ func Test_RunPendingBackups_WhenFailedBackupsExceedMaxRetries_SkipsBackup(t *tes
 		})
 	}
 
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -464,10 +467,10 @@ func Test_RunPendingBackups_WhenFailedBackupsExceedMaxRetries_SkipsBackup(t *tes
 }
 
 func Test_RunPendingBackups_WhenBackupsDisabled_SkipsBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	cache.GetStore().Clear(t.Context())
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -478,11 +481,11 @@ func Test_RunPendingBackups_WhenBackupsDisabled_SkipsBackup(t *testing.T) {
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	backupConfig, err := backups_config_logical.GetBackupConfigService().GetBackupConfigByDbId(database.ID)
@@ -499,7 +502,7 @@ func Test_RunPendingBackups_WhenBackupsDisabled_SkipsBackup(t *testing.T) {
 	backupConfig.Storage = storage
 	backupConfig.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	// add old backup that would trigger new backup if enabled
@@ -512,7 +515,7 @@ func Test_RunPendingBackups_WhenBackupsDisabled_SkipsBackup(t *testing.T) {
 		CreatedAt: time.Now().UTC().Add(-24 * time.Hour),
 	})
 
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -525,11 +528,11 @@ func Test_RunPendingBackups_WhenBackupsDisabled_SkipsBackup(t *testing.T) {
 }
 
 func Test_FailBackupsInProgress_WhenSchedulerStarts_CancelsBackupsAndUpdatesStatus(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -540,13 +543,13 @@ func Test_FailBackupsInProgress_WhenSchedulerStarts_CancelsBackupsAndUpdatesStat
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 
-		cache_utils.ClearAllCache()
+		cache.GetStore().Clear(t.Context())
 	}()
 
 	backupConfig, err := backups_config_logical.GetBackupConfigService().GetBackupConfigByDbId(database.ID)
@@ -563,7 +566,7 @@ func Test_FailBackupsInProgress_WhenSchedulerStarts_CancelsBackupsAndUpdatesStat
 	backupConfig.Storage = storage
 	backupConfig.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	// Create two in-progress backups that should be failed on scheduler restart
@@ -600,7 +603,7 @@ func Test_FailBackupsInProgress_WhenSchedulerStarts_CancelsBackupsAndUpdatesStat
 
 	// Trigger the scheduler's failBackupsInProgress logic
 	// This should cancel in-progress backups and mark them as failed
-	err = GetBackupsScheduler().failBackupsInProgress()
+	err = GetBackupsScheduler().failBackupsInProgress(t.Context(), logger.GetLogger())
 	assert.NoError(t, err)
 
 	// Verify all backups exist and were processed correctly
@@ -632,10 +635,10 @@ func Test_FailBackupsInProgress_WhenSchedulerStarts_CancelsBackupsAndUpdatesStat
 }
 
 func Test_StartBackup_WhenBackupAlreadyInProgress_SkipsNewBackup(t *testing.T) {
-	cache_utils.ClearAllCache()
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	cache.GetStore().Clear(t.Context())
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -646,11 +649,11 @@ func Test_StartBackup_WhenBackupAlreadyInProgress_SkipsNewBackup(t *testing.T) {
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	backupConfig, err := backups_config_logical.GetBackupConfigService().GetBackupConfigByDbId(database.ID)
@@ -667,7 +670,7 @@ func Test_StartBackup_WhenBackupAlreadyInProgress_SkipsNewBackup(t *testing.T) {
 	backupConfig.Storage = storage
 	backupConfig.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	// Create an in-progress backup manually
@@ -682,7 +685,7 @@ func Test_StartBackup_WhenBackupAlreadyInProgress_SkipsNewBackup(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Try to start a new backup - should be skipped
-	GetBackupsScheduler().StartBackup(database, false)
+	GetBackupsScheduler().StartBackup(t.Context(), database, false)
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -699,10 +702,10 @@ func Test_StartBackup_WhenBackupAlreadyInProgress_SkipsNewBackup(t *testing.T) {
 func Test_RunPendingBackups_WhenLastBackupFailedWithIsSkipRetry_SkipsBackupEvenWithRetriesEnabled(
 	t *testing.T,
 ) {
-	cache_utils.ClearAllCache()
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	cache.GetStore().Clear(t.Context())
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
@@ -713,11 +716,11 @@ func Test_RunPendingBackups_WhenLastBackupFailedWithIsSkipRetry_SkipsBackupEvenW
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups with retries enabled and high retry count
@@ -737,7 +740,7 @@ func Test_RunPendingBackups_WhenLastBackupFailedWithIsSkipRetry_SkipsBackupEvenW
 	backupConfig.IsRetryIfFailed = true
 	backupConfig.MaxFailedTriesCount = 5
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig)
 	assert.NoError(t, err)
 
 	// Create a failed backup with IsSkipRetry set to true
@@ -758,11 +761,11 @@ func Test_RunPendingBackups_WhenLastBackupFailedWithIsSkipRetry_SkipsBackupEvenW
 	assert.NoError(t, err)
 	assert.NotNil(t, lastBackup)
 
-	remainedTries := GetBackupsScheduler().GetRemainedBackupTryCount(lastBackup)
+	remainedTries := GetBackupsScheduler().GetRemainedBackupTryCount(t.Context(), logger.GetLogger(), lastBackup)
 	assert.Equal(t, 0, remainedTries, "Should return 0 tries when IsSkipRetry is true")
 
 	// Run the scheduler
-	GetBackupsScheduler().runPendingBackups()
+	GetBackupsScheduler().runPendingBackups(t.Context(), logger.GetLogger())
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -775,7 +778,7 @@ func Test_RunPendingBackups_WhenLastBackupFailedWithIsSkipRetry_SkipsBackupEvenW
 }
 
 func Test_StartBackup_When2BackupsStartedForDifferentDatabases_BothUseCasesAreCalled(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 
 	// Create mock tracking use case
 	mockUseCase := NewMockTrackingBackupUsecase()
@@ -790,9 +793,9 @@ func Test_StartBackup_When2BackupsStartedForDifferentDatabases_BothUseCasesAreCa
 	defer schedulerCancel()
 
 	// Setup test data
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 
@@ -813,12 +816,12 @@ func Test_StartBackup_When2BackupsStartedForDifferentDatabases_BothUseCasesAreCa
 			backupRepository.DeleteByID(backup.ID)
 		}
 
-		databases.RemoveTestDatabase(database1)
-		databases.RemoveTestDatabase(database2)
+		databases.RemoveTestDatabase(t.Context(), database1)
+		databases.RemoveTestDatabase(t.Context(), database2)
 		time.Sleep(50 * time.Millisecond)
-		storages.RemoveTestStorage(storage.ID)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
 		notifiers.RemoveTestNotifier(notifier)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 	}()
 
 	// Enable backups for database1
@@ -837,7 +840,7 @@ func Test_StartBackup_When2BackupsStartedForDifferentDatabases_BothUseCasesAreCa
 	backupConfig1.Storage = storage
 	backupConfig1.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig1)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig1)
 	assert.NoError(t, err)
 
 	// Enable backups for database2
@@ -855,15 +858,15 @@ func Test_StartBackup_When2BackupsStartedForDifferentDatabases_BothUseCasesAreCa
 	backupConfig2.Storage = storage
 	backupConfig2.StorageID = &storage.ID
 
-	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(backupConfig2)
+	_, err = backups_config_logical.GetBackupConfigService().SaveBackupConfig(t.Context(), backupConfig2)
 	assert.NoError(t, err)
 
 	// Start 2 backups simultaneously
 	t.Log("Starting backup for database1")
-	scheduler.StartBackup(database1, false)
+	scheduler.StartBackup(t.Context(), database1, false)
 
 	t.Log("Starting backup for database2")
-	scheduler.StartBackup(database2, false)
+	scheduler.StartBackup(t.Context(), database2, false)
 
 	// Wait up to 10 seconds for both backups to complete
 	t.Log("Waiting for both backups to complete...")
@@ -923,4 +926,46 @@ func Test_StartBackup_When2BackupsStartedForDifferentDatabases_BothUseCasesAreCa
 	}
 
 	time.Sleep(200 * time.Millisecond)
+}
+
+// Pins issue #748: the goroutine spawned by StartBackup outlives the HTTP request
+// that triggered it, so the notification at the end of the backup must not run on
+// the request's canceled context.
+func Test_StartBackup_WhenRequestContextCanceledAfterStart_NotificationContextStaysAlive(t *testing.T) {
+	fixture := CreateBackupTestFixture(t, "Canceled Request Context Workspace")
+
+	notificationSender := &sendContextCapturingNotificationSender{
+		notificationSent: make(chan struct{}),
+	}
+	backuper := CreateTestBackuperWithUseCase(&CreateSuccessBackupUsecase{})
+	backuper.notificationSender = notificationSender
+
+	scheduler := CreateTestSchedulerWithBackuper(backuper)
+
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	scheduler.StartBackup(requestCtx, fixture.Database, true)
+	cancelRequest()
+
+	select {
+	case <-notificationSender.notificationSent:
+	case <-time.After(10 * time.Second):
+		t.Fatal("notification was never sent after the backup completed")
+	}
+
+	assert.NoError(t, notificationSender.capturedSendContextErr,
+		"notification must run on a context that outlives the HTTP request")
+}
+
+type sendContextCapturingNotificationSender struct {
+	capturedSendContextErr error
+	notificationSent       chan struct{}
+}
+
+func (s *sendContextCapturingNotificationSender) SendNotification(
+	ctx context.Context,
+	_ *notifiers.Notifier,
+	_ notifier_models.Notification,
+) {
+	s.capturedSendContextErr = ctx.Err()
+	close(s.notificationSent)
 }

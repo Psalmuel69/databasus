@@ -1,6 +1,8 @@
 package notifiers
 
 import (
+	"context"
+
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
@@ -38,6 +40,10 @@ func (r *NotifierRepository) Save(notifier *Notifier) (*Notifier, error) {
 			if notifier.TeamsNotifier != nil {
 				notifier.TeamsNotifier.NotifierID = notifier.ID
 			}
+		case NotifierTypeMattermost:
+			if notifier.MattermostNotifier != nil {
+				notifier.MattermostNotifier.NotifierID = notifier.ID
+			}
 		}
 
 		if notifier.ID == uuid.Nil {
@@ -49,6 +55,7 @@ func (r *NotifierRepository) Save(notifier *Notifier) (*Notifier, error) {
 					"SlackNotifier",
 					"DiscordNotifier",
 					"TeamsNotifier",
+					"MattermostNotifier",
 				).
 				Create(notifier).Error; err != nil {
 				return err
@@ -62,6 +69,7 @@ func (r *NotifierRepository) Save(notifier *Notifier) (*Notifier, error) {
 					"SlackNotifier",
 					"DiscordNotifier",
 					"TeamsNotifier",
+					"MattermostNotifier",
 				).
 				Save(notifier).Error; err != nil {
 				return err
@@ -111,6 +119,13 @@ func (r *NotifierRepository) Save(notifier *Notifier) (*Notifier, error) {
 					return err
 				}
 			}
+		case NotifierTypeMattermost:
+			if notifier.MattermostNotifier != nil {
+				notifier.MattermostNotifier.NotifierID = notifier.ID
+				if err := tx.Save(notifier.MattermostNotifier).Error; err != nil {
+					return err
+				}
+			}
 		}
 
 		return nil
@@ -122,17 +137,19 @@ func (r *NotifierRepository) Save(notifier *Notifier) (*Notifier, error) {
 	return notifier, nil
 }
 
-func (r *NotifierRepository) FindByID(id uuid.UUID) (*Notifier, error) {
+func (r *NotifierRepository) FindByID(ctx context.Context, id uuid.UUID) (*Notifier, error) {
 	var notifier Notifier
 
 	if err := storage.
 		GetDb().
+		WithContext(ctx).
 		Preload("TelegramNotifier").
 		Preload("EmailNotifier").
 		Preload("WebhookNotifier").
 		Preload("SlackNotifier").
 		Preload("DiscordNotifier").
 		Preload("TeamsNotifier").
+		Preload("MattermostNotifier").
 		Where("id = ?", id).
 		First(&notifier).Error; err != nil {
 		return nil, err
@@ -162,6 +179,7 @@ func (r *NotifierRepository) FindByWorkspaceID(workspaceID uuid.UUID) ([]*Notifi
 		Preload("SlackNotifier").
 		Preload("DiscordNotifier").
 		Preload("TeamsNotifier").
+		Preload("MattermostNotifier").
 		Where("workspace_id = ?", workspaceID).
 		Order("name ASC").
 		Find(&notifiers).Error; err != nil {
@@ -207,6 +225,12 @@ func (r *NotifierRepository) Delete(notifier *Notifier) error {
 		case NotifierTypeTeams:
 			if notifier.TeamsNotifier != nil {
 				if err := tx.Delete(notifier.TeamsNotifier).Error; err != nil {
+					return err
+				}
+			}
+		case NotifierTypeMattermost:
+			if notifier.MattermostNotifier != nil {
+				if err := tx.Delete(notifier.MattermostNotifier).Error; err != nil {
 					return err
 				}
 			}

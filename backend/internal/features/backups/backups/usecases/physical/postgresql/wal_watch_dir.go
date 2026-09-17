@@ -60,7 +60,10 @@ func (s *WalStreamSupervisor) recoverLocalSegmentsOnStartup(ctx context.Context,
 		switch {
 		case walmath.IsWalFilename(name):
 			if err := s.uploader.RecoverSegment(ctx, filepath.Join(s.watchDir, name), name); err != nil {
-				logger.Warn("startup wal recovery failed; live loop will retry", "wal_filename", name, "error", err)
+				logger.WarnContext(ctx, "startup wal recovery failed; live loop will retry",
+					"wal_filename", name,
+					"error", err,
+				)
 			}
 
 		case strings.HasSuffix(name, ".history"):
@@ -74,7 +77,7 @@ func (s *WalStreamSupervisor) recoverLocalSegmentsOnStartup(ctx context.Context,
 func (s *WalStreamSupervisor) scanAndUpload(ctx context.Context, logger *slog.Logger) {
 	entries, err := os.ReadDir(s.watchDir)
 	if err != nil {
-		logger.Error("read wal watch dir", "error", err)
+		logger.ErrorContext(ctx, "read wal watch dir", "error", err)
 
 		return
 	}
@@ -89,7 +92,10 @@ func (s *WalStreamSupervisor) scanAndUpload(ctx context.Context, logger *slog.Lo
 		switch {
 		case walmath.IsWalFilename(name):
 			if err := s.uploader.ProcessSegment(ctx, filepath.Join(s.watchDir, name), name); err != nil {
-				logger.Warn("wal segment upload failed; will retry next tick", "wal_filename", name, "error", err)
+				logger.WarnContext(ctx, "wal segment upload failed; will retry next tick",
+					"wal_filename", name,
+					"error", err,
+				)
 			}
 
 		case strings.HasSuffix(name, ".history"):
@@ -120,7 +126,7 @@ func (s *WalStreamSupervisor) sweepPendingUploads(
 		}
 
 		if err := upload(ctx, filepath.Join(pendingUploadDir, entry.Name()), entry.Name()); err != nil {
-			logger.Warn("pending wal segment upload failed; will retry next tick",
+			logger.WarnContext(ctx, "pending wal segment upload failed; will retry next tick",
 				"wal_filename", entry.Name(), "error", err)
 		}
 	}
@@ -131,32 +137,40 @@ func (s *WalStreamSupervisor) sweepPendingUploads(
 func (s *WalStreamSupervisor) archiveTimelineHistoryFile(ctx context.Context, logger *slog.Logger, name string) {
 	timelineID, err := parseHistoryTimeline(name)
 	if err != nil {
-		logger.Warn("skip unparseable history file", "name", name, "error", err)
+		logger.WarnContext(ctx, "skip unparseable history file", "name", name, "error", err)
 
 		return
 	}
 
 	conn, err := s.spec.SourceDB.OpenInspectionConn(ctx, s.spec.FieldEncryptor)
 	if err != nil {
-		logger.Warn("could not open connection to upload history file; will retry", "error", err)
+		logger.WarnContext(ctx, "could not open connection to upload history file; will retry", "error", err)
 
 		return
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
 
-	if _, err := UploadHistoryFile(
-		ctx, conn, timelineID, s.spec.Storage, s.spec.SourceDB, s.spec.StorageID,
-		s.spec.HistoryRepo, s.spec.Encryption, s.spec.MasterKey, s.spec.FieldEncryptor, logger,
-	); err != nil {
-		logger.Warn("history upload failed; will retry next tick", "timeline_id", timelineID, "error", err)
+	if _, err := UploadHistoryFile(ctx, HistoryUploadSpec{
+		Conn:           conn,
+		TimelineID:     timelineID,
+		FileStore:      s.spec.FileStore,
+		SourceDB:       s.spec.SourceDB,
+		StorageID:      s.spec.StorageID,
+		HistoryRepo:    s.spec.HistoryRepo,
+		Encryption:     s.spec.Encryption,
+		MasterKey:      s.spec.MasterKey,
+		FieldEncryptor: s.spec.FieldEncryptor,
+		Logger:         logger,
+	}); err != nil {
+		logger.WarnContext(ctx, "history upload failed; will retry next tick", "timeline_id", timelineID, "error", err)
 
 		return
 	}
 
-	logger.Info("timeline switch observed via .history", "timeline_id", timelineID)
+	logger.InfoContext(ctx, "timeline switch observed via .history", "timeline_id", timelineID)
 
 	if err := os.Remove(filepath.Join(s.watchDir, name)); err != nil && !os.IsNotExist(err) {
-		logger.Warn("failed to remove uploaded history file", "name", name, "error", err)
+		logger.WarnContext(ctx, "failed to remove uploaded history file", "name", name, "error", err)
 	}
 }
 

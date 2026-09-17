@@ -49,6 +49,10 @@ const (
 	restoredPgUser     = "testuser"
 	restoredPgPassword = "testpassword"
 	restoredPgDatabase = "testdb"
+
+	// Replaying a PITR chain is disk-bound and runs while the test holds several containers, so this
+	// is sized for a loaded machine rather than for the few seconds it takes when idle.
+	recoveryCompletionTimeout = 3 * time.Minute
 )
 
 // setupReplicationOnlyFixture boots a throwaway replication-capable source for one PostgreSQL major,
@@ -336,10 +340,10 @@ func useReplicationOnlyUserViaAPI(
 	physical.Username = provisioned.Username
 	physical.Password = provisioned.Password
 
-	isMinimal, excessivePrivileges, err := physical.IsUserReplicationOnly(
+	shouldSuggestReplicationOnlyUser, excessivePrivileges, err := physical.ShouldSuggestReplicationOnlyUser(
 		t.Context(), logger.GetLogger(), encryption.GetFieldEncryptor())
 	require.NoError(t, err)
-	require.True(t, isMinimal,
+	require.False(t, shouldSuggestReplicationOnlyUser,
 		"backups must run through a replication-only user; excessive privileges: %v", excessivePrivileges)
 	require.Empty(t, excessivePrivileges)
 }
@@ -734,7 +738,8 @@ func createMarkerTable(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 		_, _ = conn.Exec(context.Background(), `DROP TABLE IF EXISTS restore_marker`)
 	})
 
-	_, err = conn.Exec(ctx,
+	_, err = conn.Exec(
+		ctx,
 		`CREATE TABLE restore_marker (phase TEXT PRIMARY KEY, payload TEXT NOT NULL)`)
 	require.NoError(t, err)
 }
@@ -742,7 +747,8 @@ func createMarkerTable(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 func insertMarker(t *testing.T, ctx context.Context, conn *pgx.Conn, phase, payload string) {
 	t.Helper()
 
-	_, err := conn.Exec(ctx,
+	_, err := conn.Exec(
+		ctx,
 		`INSERT INTO restore_marker (phase, payload) VALUES ($1, $2)`, phase, payload)
 	require.NoError(t, err)
 }
@@ -771,6 +777,28 @@ func waitForReplayableThroughLSN(t *testing.T, databaseID uuid.UUID, throughLSN 
 
 	t.Fatalf("contiguous replayable WAL never reached LSN %s within %s (latest reachable %s)",
 		throughLSN.String(), timeout, lastReachable.String())
+}
+
+// Reaching the target's LSN is not enough on its own: the resolver compares the
+// target against the receive time of the last segment in the contiguous run, so a
+// run that already extends past the target by LSN can still end at a segment
+// archived before it.
+func waitForTargetTimeReplayable(t *testing.T, databaseID uuid.UUID, targetTime time.Time, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().UTC().Add(timeout)
+
+	var lastErr error
+	for time.Now().UTC().Before(deadline) {
+		_, lastErr = chain_view.GetChainViewService().ResolveRestoreSet(databaseID, &targetTime)
+		if lastErr == nil {
+			return
+		}
+
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	t.Fatalf("target time %s never became restorable within %s: %v", targetTime, timeout, lastErr)
 }
 
 // seedChainAndStreamPastTarget seeds the marker table, builds FULL -> INCR -> INCR over the API, then
@@ -935,6 +963,29 @@ func startRestoredCluster(t *testing.T, target containers.RestoreTarget, image s
 		target.ExecBestEffort("postgres",
 			"pg_ctl", "-D", clusterDir, "-m", "immediate", "stop")
 	})
+
+	waitForRecoveryToFinish(t, target)
+}
+
+// pg_ctl -w returns as soon as the cluster accepts connections, which during recovery means
+// read-only and mid-replay: a query issued then sees whichever prefix of the WAL has been applied so
+// far. Recovery with a target promotes when it reaches it, so leaving recovery is the real signal
+// that the restored data is complete.
+func waitForRecoveryToFinish(t *testing.T, target containers.RestoreTarget) {
+	t.Helper()
+
+	deadline := time.Now().UTC().Add(recoveryCompletionTimeout)
+	for time.Now().UTC().Before(deadline) {
+		recoveryState := target.ExecBestEffort("postgres",
+			"psql", "-U", restoredPgUser, "-d", restoredPgDatabase, "-tAc", "SELECT pg_is_in_recovery()")
+		if strings.TrimSpace(string(recoveryState)) == "f" {
+			return
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	t.Fatalf("the restored cluster was still replaying WAL after %s", recoveryCompletionTimeout)
 }
 
 func queryRestoredMarkerRows(t *testing.T, target containers.RestoreTarget) []string {
@@ -1007,7 +1058,8 @@ func waitForMarkerOnStandby(
 	deadline := time.Now().UTC().Add(timeout)
 	for time.Now().UTC().Before(deadline) {
 		var exists bool
-		if err := standbyConn.QueryRow(ctx,
+		if err := standbyConn.QueryRow(
+			ctx,
 			`SELECT EXISTS(SELECT 1 FROM restore_marker WHERE phase = $1)`, phase,
 		).Scan(&exists); err == nil && exists {
 			return
@@ -1027,7 +1079,8 @@ func PromoteStandby(t *testing.T, ctx context.Context, standbyConn *pgx.Conn) {
 	t.Helper()
 
 	var promoted bool
-	require.NoError(t, standbyConn.QueryRow(ctx,
+	require.NoError(t, standbyConn.QueryRow(
+		ctx,
 		`SELECT pg_promote(wait => true, wait_seconds => 60)`).Scan(&promoted))
 	require.True(t, promoted, "pg_promote must finish promotion within its wait window")
 

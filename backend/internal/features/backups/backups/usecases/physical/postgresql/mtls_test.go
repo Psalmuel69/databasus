@@ -9,6 +9,7 @@ import (
 
 	physical_repositories "databasus-backend/internal/features/backups/backups/core/physical/repositories"
 	"databasus-backend/internal/features/databases"
+	"databasus-backend/internal/features/storages"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/logger"
 	"databasus-backend/internal/util/testing/containers"
@@ -88,6 +89,7 @@ func Test_FullOverMtls_ProducesArtifactAndManifest(t *testing.T) {
 			DatabaseName:   fixture.DB.Name,
 			StorageID:      fixture.Storage.ID,
 			Storage:        fixture.Storage,
+			FileStore:      storages.GetStorageFileStore(),
 			Encryption:     fullRow.Encryption,
 			FieldEncryptor: encryption.GetFieldEncryptor(),
 			FullRepo:       physical_repositories.GetFullBackupRepository(),
@@ -106,12 +108,22 @@ func Test_FullOverMtls_ProducesArtifactAndManifest(t *testing.T) {
 	)
 
 	require.NotEmpty(t, result.FileName)
-	artifact, err := fixture.Storage.GetFile(encryption.GetFieldEncryptor(), result.FileName)
+	artifact, err := fixture.Storage.GetFile(
+		t.Context(),
+		encryption.GetFieldEncryptor(),
+		logger.GetLogger(),
+		result.FileName,
+	)
 	require.NoError(t, err, "artifact must be in storage")
 	require.NoError(t, artifact.Close())
 
 	require.NotEmpty(t, result.ManifestFileName)
-	manifest, err := fixture.Storage.GetFile(encryption.GetFieldEncryptor(), result.ManifestFileName)
+	manifest, err := fixture.Storage.GetFile(
+		t.Context(),
+		encryption.GetFieldEncryptor(),
+		logger.GetLogger(),
+		result.ManifestFileName,
+	)
 	require.NoError(t, err, "reconstructed manifest must be in storage")
 	require.NoError(t, manifest.Close())
 }

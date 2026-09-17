@@ -195,6 +195,20 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 
 	var isDiskLimitHit atomic.Bool
 
+	// Every stage running under jobCtx must consult this before treating a
+	// cancelled context as a silent abort: the watcher cancels jobCtx itself, so
+	// a bare `jobCtx.Err() != nil` early return would swallow the disk verdict
+	// and leave the verification hanging until the backend reclaims it.
+	reportIfDiskLimitHit := func() bool {
+		if !isDiskLimitHit.Load() {
+			return false
+		}
+
+		r.reportDiskLimitExceeded(ctx, job.VerificationID, diskBudgetFailMessage, runLogger)
+
+		return true
+	}
+
 	// A zero/absent budget (older backend) means no enforceable ceiling — skip
 	// the watcher rather than trip instantly on used >= 0.
 	if diskBudgetMb > 0 {
@@ -219,9 +233,7 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 		archivePath,
 		runLogger,
 	); err != nil {
-		if isDiskLimitHit.Load() {
-			r.reportDiskLimitExceeded(ctx, job.VerificationID, diskBudgetFailMessage, runLogger)
-
+		if reportIfDiskLimitHit() {
 			return
 		}
 
@@ -232,6 +244,29 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 		r.reportFailure(ctx, job.VerificationID, nil, fmt.Sprintf("download backup: %v", err), runLogger)
 
 		return
+	}
+
+	archiveOwnerRoleNames, err := r.restorer.EnsureArchiveOwnerRoles(
+		jobCtx, jobContainer, archivePath, jobContainer.GetVerifierConn())
+	if err != nil {
+		if reportIfDiskLimitHit() {
+			return
+		}
+
+		if jobCtx.Err() != nil {
+			return
+		}
+
+		r.reportFailure(ctx, job.VerificationID, nil,
+			fmt.Sprintf("ensure archive owner roles: %v", err), runLogger)
+
+		return
+	}
+
+	if len(archiveOwnerRoleNames) > 0 {
+		runLogger.Info(fmt.Sprintf(
+			"archive owner roles present in restore target: roles=%s",
+			strings.Join(archiveOwnerRoleNames, ",")))
 	}
 
 	parallelJobs := min(maxParallelRestoreJobs, r.capacity.CPUPerJob)
@@ -246,6 +281,10 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 		parallelJobs = 1
 
 		if err := r.restorer.RunTimescalePreRestore(jobCtx, jobContainer.GetVerifierConn()); err != nil {
+			if reportIfDiskLimitHit() {
+				return
+			}
+
 			if jobCtx.Err() != nil {
 				return
 			}
@@ -257,12 +296,14 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 		}
 	}
 
-	restoreResult, err := r.restorer.RunPgRestore(
-		jobCtx, jobContainer, archivePath, jobContainer.GetInContainerConn(), parallelJobs)
+	restoreResult, err := r.restorer.RunPgRestore(jobCtx, jobContainer, restore.PgRestoreSpec{
+		ArchivePath:   archivePath,
+		Conn:          jobContainer.GetInContainerConn(),
+		ParallelJobs:  parallelJobs,
+		IsTimescaledb: job.TimescaledbVersion != "",
+	})
 	if err != nil {
-		if isDiskLimitHit.Load() {
-			r.reportDiskLimitExceeded(ctx, job.VerificationID, diskBudgetFailMessage, runLogger)
-
+		if reportIfDiskLimitHit() {
 			return
 		}
 
@@ -288,7 +329,7 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 			return
 		}
 
-		if !restore.IsMissingExtensionOnly(restoreResult.StderrTail) {
+		if !restore.IsToleratedErrorsOnly(restoreResult.StderrTail) {
 			runLogger.Error("pg_restore failed",
 				"exit_code", restoreResult.PgRestoreExitCode,
 				"stderr_tail", restoreResult.StderrTail)
@@ -299,12 +340,12 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 			return
 		}
 
-		// The only items pg_restore skipped are CREATE/COMMENT EXTENSION for
-		// extensions this verification environment lacks — the data restored.
-		// Treat the backup as restorable and fall through to stats; the backend's
-		// restored-size check is the remaining safety net.
+		// The only items pg_restore skipped are ones that say nothing about the archive's integrity:
+		// CREATE/COMMENT EXTENSION for extensions this environment lacks, and a public schema the
+		// target already owned — the data restored. Treat the backup as restorable and fall through
+		// to stats; the backend's restored-size check is the remaining safety net.
 		runLogger.Warn(
-			"pg_restore completed with only missing-extension errors; treating backup as restorable",
+			"pg_restore completed with only tolerated errors; treating backup as restorable",
 			"exit_code", restoreResult.PgRestoreExitCode,
 			"skipped_extensions",
 			strings.Join(restore.ExtractUnavailableExtensions(restoreResult.StderrTail), ","),
@@ -313,6 +354,10 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 
 	if job.TimescaledbVersion != "" {
 		if err := r.restorer.RunTimescalePostRestore(jobCtx, jobContainer.GetVerifierConn()); err != nil {
+			if reportIfDiskLimitHit() {
+				return
+			}
+
 			if jobCtx.Err() != nil {
 				return
 			}
@@ -328,9 +373,7 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 
 	stats, err := r.verifier.CollectStats(jobCtx, verifierConn)
 	if err != nil {
-		if isDiskLimitHit.Load() {
-			r.reportDiskLimitExceeded(ctx, job.VerificationID, diskBudgetFailMessage, runLogger)
-
+		if reportIfDiskLimitHit() {
 			return
 		}
 
@@ -351,9 +394,7 @@ func (r *Runner) executeJob(ctx context.Context, job *api.JobAssignment) {
 		return
 	}
 
-	if isDiskLimitHit.Load() {
-		r.reportDiskLimitExceeded(ctx, job.VerificationID, diskBudgetFailMessage, runLogger)
-
+	if reportIfDiskLimitHit() {
 		return
 	}
 

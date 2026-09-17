@@ -1,9 +1,10 @@
-import { Button, Modal, Spin } from 'antd';
+import { App, Button, Modal, Spin } from 'antd';
 import { useEffect, useState } from 'react';
 
 import {
   type Database,
   DatabaseType,
+  type ShouldSuggestReadOnlyUserResponse,
   databaseApi,
   getDatabaseTypeLabel,
 } from '../../../../entity/databases';
@@ -14,19 +15,23 @@ interface Props {
 
   onGoBack: () => void;
   onSkipped: () => void;
-  onAlreadyExists: () => void;
+  onReadOnlyUserNotSuggested: () => void;
 }
 
 const PRIVILEGES_TRUNCATE_LENGTH = 50;
+
+const FORCED_WAL_ROTATION_WARNING_SECONDS = 15;
 
 export const CreateReadOnlyComponent = ({
   database,
   onReadOnlyUserUpdated,
   onGoBack,
   onSkipped,
-  onAlreadyExists,
+  onReadOnlyUserNotSuggested,
 }: Props) => {
-  const [isCheckingReadOnlyUser, setIsCheckingReadOnlyUser] = useState(false);
+  const { message } = App.useApp();
+
+  const [isCheckingReadOnlyUserSuggestion, setIsCheckingReadOnlyUserSuggestion] = useState(false);
   const [isCreatingReadOnlyUser, setIsCreatingReadOnlyUser] = useState(false);
   const [isShowSkipConfirmation, setShowSkipConfirmation] = useState(false);
   const [privileges, setPrivileges] = useState<string[]>([]);
@@ -42,16 +47,15 @@ export const CreateReadOnlyComponent = ({
   const privilegesLabel = isMongodb ? 'roles' : 'privileges';
   const userKindNoun = isPhysicalPostgres ? 'replication-only user' : 'read-only user';
 
-  const checkReadOnlyUser = async (): Promise<boolean> => {
-    try {
-      const response = await databaseApi.isUserReadOnly(database);
-      setPrivileges(response.privileges || []);
-      return response.isReadOnly;
-    } catch (e) {
-      alert((e as Error).message);
-      return false;
-    }
-  };
+  const fetchReadOnlyUserSuggestion =
+    async (): Promise<ShouldSuggestReadOnlyUserResponse | null> => {
+      try {
+        return await databaseApi.shouldSuggestReadOnlyUser(database);
+      } catch (e) {
+        message.error((e as Error).message);
+        return null;
+      }
+    };
 
   const getPrivilegesDisplay = () => {
     const fullText = privileges.join(', ');
@@ -67,34 +71,55 @@ export const CreateReadOnlyComponent = ({
     return fullText.length > PRIVILEGES_TRUNCATE_LENGTH;
   };
 
-  const createReadOnlyUser = async () => {
+  const provisionAndApplyReplicationOnlyUserCredentials = async () => {
+    const response = await databaseApi.createReplicationOnlyUser(database);
+
+    if (database.postgresqlPhysical) {
+      database.postgresqlPhysical.username = response.username;
+      database.postgresqlPhysical.password = response.password;
+    }
+
+    if (!response.isForcedWalRotationAvailable) {
+      message.warning(
+        'This source would not grant EXECUTE on pg_switch_wal() to the new user, which ' +
+          'continuous WAL streaming needs to keep the recovery point close to the present. ' +
+          'Full and incremental backups work normally with these credentials.',
+        FORCED_WAL_ROTATION_WARNING_SECONDS,
+      );
+    }
+  };
+
+  const provisionAndApplyReadOnlyUserCredentials = async () => {
+    const response = await databaseApi.createReadOnlyUser(database);
+
+    if (isLogicalPostgres && database.postgresqlLogical) {
+      database.postgresqlLogical.username = response.username;
+      database.postgresqlLogical.password = response.password;
+    } else if (isMysql && database.mysql) {
+      database.mysql.username = response.username;
+      database.mysql.password = response.password;
+    } else if (isMariadb && database.mariadb) {
+      database.mariadb.username = response.username;
+      database.mariadb.password = response.password;
+    } else if (isMongodb && database.mongodb) {
+      database.mongodb.username = response.username;
+      database.mongodb.password = response.password;
+    }
+  };
+
+  const provisionRestrictedUser = async () => {
     setIsCreatingReadOnlyUser(true);
 
     try {
-      const response = isPhysicalPostgres
-        ? await databaseApi.createReplicationOnlyUser(database)
-        : await databaseApi.createReadOnlyUser(database);
-
-      if (isPhysicalPostgres && database.postgresqlPhysical) {
-        database.postgresqlPhysical.username = response.username;
-        database.postgresqlPhysical.password = response.password;
-      } else if (isLogicalPostgres && database.postgresqlLogical) {
-        database.postgresqlLogical.username = response.username;
-        database.postgresqlLogical.password = response.password;
-      } else if (isMysql && database.mysql) {
-        database.mysql.username = response.username;
-        database.mysql.password = response.password;
-      } else if (isMariadb && database.mariadb) {
-        database.mariadb.username = response.username;
-        database.mariadb.password = response.password;
-      } else if (isMongodb && database.mongodb) {
-        database.mongodb.username = response.username;
-        database.mongodb.password = response.password;
+      if (isPhysicalPostgres) {
+        await provisionAndApplyReplicationOnlyUserCredentials();
+      } else {
+        await provisionAndApplyReadOnlyUserCredentials();
       }
 
       onReadOnlyUserUpdated(database);
     } catch (e) {
-      alert((e as Error).message);
+      message.error((e as Error).message);
     }
 
     setIsCreatingReadOnlyUser(false);
@@ -111,19 +136,23 @@ export const CreateReadOnlyComponent = ({
 
   useEffect(() => {
     const run = async () => {
-      setIsCheckingReadOnlyUser(true);
+      setIsCheckingReadOnlyUserSuggestion(true);
 
-      const isReadOnly = await checkReadOnlyUser();
-      if (isReadOnly) {
-        onAlreadyExists();
+      const readOnlyUserSuggestion = await fetchReadOnlyUserSuggestion();
+      setPrivileges(readOnlyUserSuggestion?.privileges || []);
+
+      // A failed check must not silently advance the wizard - keep the screen so the user
+      // still gets the choice.
+      if (readOnlyUserSuggestion && !readOnlyUserSuggestion.shouldSuggestReadOnlyUser) {
+        onReadOnlyUserNotSuggested();
       }
 
-      setIsCheckingReadOnlyUser(false);
+      setIsCheckingReadOnlyUserSuggestion(false);
     };
     run();
   }, []);
 
-  if (isCheckingReadOnlyUser) {
+  if (isCheckingReadOnlyUserSuggestion) {
     return (
       <div className="flex items-center">
         <Spin />
@@ -203,7 +232,7 @@ export const CreateReadOnlyComponent = ({
 
         <Button
           type="primary"
-          onClick={createReadOnlyUser}
+          onClick={provisionRestrictedUser}
           loading={isCreatingReadOnlyUser}
           disabled={isCreatingReadOnlyUser}
         >

@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,7 +15,7 @@ import (
 	backups_core_enums "databasus-backend/internal/features/backups/backups/core/enums"
 	physical_enums "databasus-backend/internal/features/backups/backups/core/physical/enums"
 	backup_encryption "databasus-backend/internal/features/backups/backups/encryption"
-	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	util_encryption "databasus-backend/internal/util/encryption"
 )
 
@@ -36,7 +35,8 @@ const (
 // runStreamParams carries everything runStream needs that does not come from the
 // *exec.Cmd itself. Grouped into a struct so FULL and INCR pass the same shape.
 type runStreamParams struct {
-	Storage        storages.StorageFileSaver
+	FileStore      storage_files.FileStore
+	StorageID      uuid.UUID
 	FieldEncryptor util_encryption.FieldEncryptor
 	Logger         *slog.Logger
 
@@ -126,7 +126,10 @@ func runStream(
 
 	counter := NewByteCounter(finalWriter)
 
-	stopWatcher := WithByteStallWatcher(streamCtx, counter, ByteStallTimeout, func() {
+	stopWatcher := WithByteStallWatcher(streamCtx, counter, ByteStallThresholds{
+		FirstByteTimeout: FirstByteTimeout,
+		StallTimeout:     ByteStallTimeout,
+	}, func() {
 		p.Logger.Warn("byte-stall timeout tripped; terminating pg_basebackup",
 			"backup_id", p.BackupID,
 			"file_name", p.FileName)
@@ -140,17 +143,13 @@ func runStream(
 		defer stopProgress()
 	}
 
-	saveErrCh := make(chan error, 1)
-
-	go func() {
-		saveErr := p.Storage.SaveFile(streamCtx, p.FieldEncryptor, p.Logger, p.FileName, storageReader)
-		if saveErr != nil {
-			_ = storageReader.CloseWithError(saveErr)
-			cancelStream(saveErr)
-		}
-
-		saveErrCh <- saveErr
-	}()
+	fileWrite := storage_files.StartBackgroundWrite(
+		streamCtx,
+		p.FileStore,
+		storage_files.StoredFileReference{StorageID: p.StorageID, FileName: p.FileName},
+		storageReader,
+		cancelStream,
+	)
 
 	manifestReader, manifestWriter := io.Pipe()
 	manifestResultCh := make(chan manifestWalkResult, 1)
@@ -180,7 +179,7 @@ func runStream(
 		// drain BOTH goroutines, or the manifest goroutine leaks on manifestReader.
 		_ = storageWriter.Close()
 		_ = manifestWriter.Close()
-		saveErr := <-saveErrCh
+		saveErr := <-fileWrite.Errors
 		<-manifestResultCh
 		stderr.stop()
 
@@ -224,7 +223,7 @@ func runStream(
 	_ = storageWriter.Close()
 	_ = manifestWriter.Close()
 
-	saveErr := <-saveErrCh
+	saveErr := <-fileWrite.Errors
 	manifestRes := <-manifestResultCh
 
 	stderr.stop()
@@ -273,22 +272,41 @@ func runStream(
 		return outcomeManifestCorrupted(fmt.Errorf("walk tar for manifest: %w", manifestRes.err), stderrBytes), nil
 	}
 
-	return buildSuccessOutcome(ctx, p, manifestRes.entries, counter, encryptionWriter, encSalt, encNonce, stderrBytes)
+	return buildSuccessOutcome(ctx, successOutcomeSpec{
+		Params:           p,
+		Files:            manifestRes.entries,
+		Counter:          counter,
+		EncryptionWriter: encryptionWriter,
+		EncryptionSalt:   encSalt,
+		EncryptionIV:     encNonce,
+		Stderr:           stderrBytes,
+		BaseReceipt:      <-fileWrite.Receipts,
+	})
 }
 
 // buildSuccessOutcome runs in the linear section after Wait: it parses the LSNs
 // (only complete once the process exited), serializes the manifest, and saves the
 // sidecar. Any failure here is fatal to the backup — an INCR chain without a
 // valid parent manifest is unusable — so it maps to MANIFEST_CORRUPTED.
-func buildSuccessOutcome(
-	ctx context.Context,
-	p runStreamParams,
-	files []manifestFileEntry,
-	counter *ByteCounter,
-	encryptionWriter *backup_encryption.EncryptionWriter,
-	encSalt, encNonce string,
-	stderrBytes []byte,
-) (streamOutcome, error) {
+type successOutcomeSpec struct {
+	Params           runStreamParams
+	Files            []manifestFileEntry
+	Counter          *ByteCounter
+	EncryptionWriter *backup_encryption.EncryptionWriter
+	EncryptionSalt   string
+	EncryptionIV     string
+	Stderr           []byte
+	BaseReceipt      storage_files.WriteReceipt
+}
+
+func buildSuccessOutcome(ctx context.Context, spec successOutcomeSpec) (streamOutcome, error) {
+	p := spec.Params
+	files := spec.Files
+	counter := spec.Counter
+	encryptionWriter := spec.EncryptionWriter
+	encSalt, encNonce := spec.EncryptionSalt, spec.EncryptionIV
+	stderrBytes := spec.Stderr
+
 	startLSN, stopLSN, timelineID, err := parseLsnsFromStderr(stderrBytes)
 	if err != nil {
 		return outcomeManifestCorrupted(fmt.Errorf("parse pg_basebackup LSNs: %w", err), stderrBytes), nil
@@ -314,7 +332,7 @@ func buildSuccessOutcome(
 
 	manifestFileName := p.FileName + manifestSuffix
 
-	manifestSalt, manifestIV, err := saveManifestSidecar(ctx, p, manifestFileName, manifestBytes)
+	manifest, err := saveManifestSidecar(ctx, p, manifestFileName, manifestBytes)
 	if err != nil {
 		return outcomeManifestCorrupted(fmt.Errorf("save manifest sidecar: %w", err), stderrBytes), nil
 	}
@@ -335,8 +353,9 @@ func buildSuccessOutcome(
 		EncryptionIV:           encNonce,
 		Compression:            p.Codec,
 		ManifestFileName:       manifestFileName,
-		ManifestEncryptionSalt: manifestSalt,
-		ManifestEncryptionIV:   manifestIV,
+		ManifestEncryptionSalt: manifest.SaltBase64,
+		ManifestEncryptionIV:   manifest.NonceBase64,
+		Receipts:               []storage_files.WriteReceipt{spec.BaseReceipt, manifest.Receipt},
 		Stderr:                 stderrBytes,
 	}, nil
 }
@@ -357,7 +376,12 @@ func saveManifestSidecar(
 	p runStreamParams,
 	manifestFileName string,
 	manifestBytes []byte,
-) (saltBase64, nonceBase64 string, err error) {
+) (manifestSidecar, error) {
+	var (
+		saltBase64  string
+		nonceBase64 string
+	)
+
 	payload := bytes.NewReader(manifestBytes)
 	payloadSizeBytes := len(manifestBytes)
 
@@ -366,15 +390,15 @@ func saveManifestSidecar(
 
 		encSetup, setupErr := backup_encryption.SetupEncryptionWriter(&encrypted, p.MasterKey, p.BackupID)
 		if setupErr != nil {
-			return "", "", fmt.Errorf("setup manifest encryption: %w", setupErr)
+			return manifestSidecar{}, fmt.Errorf("setup manifest encryption: %w", setupErr)
 		}
 
 		if _, writeErr := encSetup.Writer.Write(manifestBytes); writeErr != nil {
-			return "", "", fmt.Errorf("encrypt manifest: %w", writeErr)
+			return manifestSidecar{}, fmt.Errorf("encrypt manifest: %w", writeErr)
 		}
 
 		if closeErr := encSetup.Writer.Close(); closeErr != nil {
-			return "", "", fmt.Errorf("flush manifest encryption: %w", closeErr)
+			return manifestSidecar{}, fmt.Errorf("flush manifest encryption: %w", closeErr)
 		}
 
 		payload = bytes.NewReader(encrypted.Bytes())
@@ -395,20 +419,24 @@ func saveManifestSidecar(
 	saveCtx, cancel := context.WithTimeout(ctx, saveTimeout)
 	defer cancel()
 
-	if err := p.Storage.SaveFile(saveCtx, p.FieldEncryptor, p.Logger, manifestFileName, payload); err != nil {
-		return "", "", err
+	receipt, err := p.FileStore.WriteFile(
+		saveCtx,
+		storage_files.StoredFileReference{StorageID: p.StorageID, FileName: manifestFileName},
+		payload,
+	)
+	if err != nil {
+		return manifestSidecar{}, err
 	}
 
-	return saltBase64, nonceBase64, nil
+	return manifestSidecar{Receipt: receipt, SaltBase64: saltBase64, NonceBase64: nonceBase64}, nil
 }
 
-// isCompressionUnsupportedError reports whether stderr carries pg_basebackup's
-// definitive "this build cannot compress with the requested codec" handshake
-// error (basebackup_zstd.c / basebackup_gzip.c, raised before any data streams).
-// Both "zstd compression is not supported by this build" and the gzip variant
-// share this substring, across PG 17 and 18.
-func isCompressionUnsupportedError(stderr []byte) bool {
-	return strings.Contains(string(stderr), "compression is not supported by this build")
+// manifestSidecar is what the manifest upload produced: the receipt that keeps the
+// file and the encryption material its catalog row records.
+type manifestSidecar struct {
+	Receipt     storage_files.WriteReceipt
+	SaltBase64  string
+	NonceBase64 string
 }
 
 func outcomeNetworkStall(stderr []byte) streamOutcome {

@@ -12,28 +12,25 @@ import (
 	"gorm.io/gorm"
 
 	audit_logs "databasus-backend/internal/features/audit_logs"
+	audit_logs_models "databasus-backend/internal/features/audit_logs/models"
 	physical_core_service "databasus-backend/internal/features/backups/backups/core/physical/service"
-	"databasus-backend/internal/features/databases/databases/mariadb"
-	"databasus-backend/internal/features/databases/databases/mongodb"
-	"databasus-backend/internal/features/databases/databases/mysql"
-	postgresql_logical "databasus-backend/internal/features/databases/databases/postgresql/logical"
 	postgresql_physical "databasus-backend/internal/features/databases/databases/postgresql/physical"
 	"databasus-backend/internal/features/notifiers"
 	users_models "databasus-backend/internal/features/users/models"
-	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"databasus-backend/internal/util/encryption"
 )
 
 type DatabaseService struct {
-	dbRepository    *DatabaseRepository
+	dbRepository    databaseStore
 	notifierService *notifiers.NotifierService
 	logger          *slog.Logger
 
-	dbCreationListener []DatabaseCreationListener
-	dbRemoveListener   []DatabaseRemoveListener
-	dbCopyListener     []DatabaseCopyListener
+	dbCreationListener         []DatabaseCreationListener
+	dbRemoveListener           []DatabaseRemoveListener
+	dbCopyListener             []DatabaseCopyListener
+	dbBackupTypeChangeListener []DatabaseBackupTypeChangeListener
 
-	workspaceService      *workspaces_services.WorkspaceService
+	workspaceService      workspaceService
 	auditLogService       *audit_logs.AuditLogService
 	fieldEncryptor        encryption.FieldEncryptor
 	physicalBackupService *physical_core_service.PhysicalBackupService
@@ -57,6 +54,12 @@ func (s *DatabaseService) AddDbCopyListener(
 	s.dbCopyListener = append(s.dbCopyListener, dbCopyListener)
 }
 
+func (s *DatabaseService) AddDbBackupTypeChangeListener(
+	dbBackupTypeChangeListener DatabaseBackupTypeChangeListener,
+) {
+	s.dbBackupTypeChangeListener = append(s.dbBackupTypeChangeListener, dbBackupTypeChangeListener)
+}
+
 func (s *DatabaseService) GetNotifierAttachedDatabasesIDs(
 	notifierID uuid.UUID,
 ) ([]uuid.UUID, error) {
@@ -69,11 +72,12 @@ func (s *DatabaseService) GetNotifierAttachedDatabasesIDs(
 }
 
 func (s *DatabaseService) CreateDatabase(
+	ctx context.Context,
 	user *users_models.User,
 	workspaceID uuid.UUID,
 	database *Database,
 ) (*Database, error) {
-	canManage, err := s.workspaceService.CanUserManageDBs(workspaceID, user)
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, workspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -87,13 +91,33 @@ func (s *DatabaseService) CreateDatabase(
 		return nil, err
 	}
 
-	if err := database.PopulateDbData(s.logger, s.fieldEncryptor); err != nil {
+	// The database has no ID until it is saved, so the workspace is all there is to correlate on.
+	logger := s.logger.With("workspace_id", workspaceID)
+
+	tunneledDatabase, err := OpenTunnel(ctx, OpenTunnelSpec{
+		Database:  database,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	// Never reassign database here: the original is what gets encrypted and saved below, and the
+	// copy carries a loopback address, an ephemeral port and a disabled tunnel.
+	databaseThroughTunnel := tunneledDatabase.GetDatabaseThroughTunnel()
+
+	if err := databaseThroughTunnel.PopulateDbData(logger, s.fieldEncryptor); err != nil {
 		return nil, fmt.Errorf("failed to auto-detect database data: %w", err)
 	}
 
-	if err := database.TestConnection(s.logger, s.fieldEncryptor); err != nil {
+	if err := databaseThroughTunnel.TestConnection(logger, s.fieldEncryptor); err != nil {
 		return nil, err
 	}
+
+	tunneledDatabase.CopyDiscoveredMetadataToOriginal()
 
 	if err := database.EncryptSensitiveFields(s.fieldEncryptor); err != nil {
 		return nil, fmt.Errorf("failed to encrypt sensitive fields: %w", err)
@@ -105,19 +129,20 @@ func (s *DatabaseService) CreateDatabase(
 	}
 
 	for _, listener := range s.dbCreationListener {
-		listener.OnDatabaseCreated(database.ID)
+		listener.OnDatabaseCreated(ctx, database.ID)
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database created: %s", database.Name),
-		&user.ID,
-		&workspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message:     fmt.Sprintf("Database created: %s", database.Name),
+		UserID:      &user.ID,
+		WorkspaceID: &workspaceID,
+	})
 
 	return database, nil
 }
 
 func (s *DatabaseService) UpdateDatabase(
+	ctx context.Context,
 	user *users_models.User,
 	database *Database,
 ) error {
@@ -134,7 +159,7 @@ func (s *DatabaseService) UpdateDatabase(
 		return errors.New("cannot update database without workspace")
 	}
 
-	canManage, err := s.workspaceService.CanUserManageDBs(*existingDatabase.WorkspaceID, user)
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, *existingDatabase.WorkspaceID, user)
 	if err != nil {
 		return err
 	}
@@ -152,19 +177,39 @@ func (s *DatabaseService) UpdateDatabase(
 		}
 	}
 
+	oldBackupType := getPhysicalBackupType(existingDatabase)
+
 	existingDatabase.Update(database)
 
 	if err := existingDatabase.Validate(); err != nil {
 		return err
 	}
 
-	if err := existingDatabase.PopulateDbData(s.logger, s.fieldEncryptor); err != nil {
+	logger := s.logger.With("database_id", existingDatabase.ID)
+
+	tunneledDatabase, err := OpenTunnel(ctx, OpenTunnelSpec{
+		Database:  existingDatabase,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
+	if err != nil {
+		return err
+	}
+
+	defer tunneledDatabase.Close()
+
+	// Never reassign existingDatabase here: it is what gets encrypted and saved below.
+	databaseThroughTunnel := tunneledDatabase.GetDatabaseThroughTunnel()
+
+	if err := databaseThroughTunnel.PopulateDbData(logger, s.fieldEncryptor); err != nil {
 		return fmt.Errorf("failed to auto-detect database data: %w", err)
 	}
 
-	if err := existingDatabase.TestConnection(s.logger, s.fieldEncryptor); err != nil {
+	if err := databaseThroughTunnel.TestConnection(logger, s.fieldEncryptor); err != nil {
 		return err
 	}
+
+	tunneledDatabase.CopyDiscoveredMetadataToOriginal()
 
 	oldName := existingDatabase.Name
 
@@ -177,28 +222,35 @@ func (s *DatabaseService) UpdateDatabase(
 		return err
 	}
 
+	if newBackupType := getPhysicalBackupType(existingDatabase); newBackupType != oldBackupType {
+		for _, listener := range s.dbBackupTypeChangeListener {
+			listener.OnBackupTypeChanged(ctx, BackupTypeChange{
+				DatabaseID:    existingDatabase.ID,
+				OldBackupType: oldBackupType,
+				NewBackupType: newBackupType,
+			})
+		}
+	}
+
 	if oldName != existingDatabase.Name {
-		s.auditLogService.WriteAuditLog(
-			fmt.Sprintf(
-				"Database updated and renamed from '%s' to '%s'",
-				oldName,
-				existingDatabase.Name,
-			),
-			&user.ID,
-			existingDatabase.WorkspaceID,
-		)
+		s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+			Message:     fmt.Sprintf("Database updated and renamed from '%s' to '%s'", oldName, existingDatabase.Name),
+			UserID:      &user.ID,
+			WorkspaceID: existingDatabase.WorkspaceID,
+		})
 	} else {
-		s.auditLogService.WriteAuditLog(
-			fmt.Sprintf("Database updated: %s", existingDatabase.Name),
-			&user.ID,
-			existingDatabase.WorkspaceID,
-		)
+		s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+			Message:     fmt.Sprintf("Database updated: %s", existingDatabase.Name),
+			UserID:      &user.ID,
+			WorkspaceID: existingDatabase.WorkspaceID,
+		})
 	}
 
 	return nil
 }
 
 func (s *DatabaseService) DeleteDatabase(
+	ctx context.Context,
 	user *users_models.User,
 	id uuid.UUID,
 ) error {
@@ -211,7 +263,7 @@ func (s *DatabaseService) DeleteDatabase(
 		return errors.New("cannot delete database without workspace")
 	}
 
-	canManage, err := s.workspaceService.CanUserManageDBs(*existingDatabase.WorkspaceID, user)
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, *existingDatabase.WorkspaceID, user)
 	if err != nil {
 		return err
 	}
@@ -220,16 +272,16 @@ func (s *DatabaseService) DeleteDatabase(
 	}
 
 	for _, listener := range s.dbRemoveListener {
-		if err := listener.OnBeforeDatabaseRemove(id); err != nil {
+		if err := listener.OnBeforeDatabaseRemove(ctx, id); err != nil {
 			return err
 		}
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database deleted: %s", existingDatabase.Name),
-		&user.ID,
-		existingDatabase.WorkspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message:     fmt.Sprintf("Database deleted: %s", existingDatabase.Name),
+		UserID:      &user.ID,
+		WorkspaceID: existingDatabase.WorkspaceID,
+	})
 
 	return s.dbRepository.Delete(id)
 }
@@ -246,12 +298,12 @@ func (s *DatabaseService) DeleteDatabase(
 // parallel test suite (go test -p=N) the cascade can deadlock against a concurrent writer in
 // the same process (a backup scheduler still settling), surfacing as SQLSTATE 40P01. The
 // aborted transaction is transient, so the whole delete — idempotent on a re-run — is retried.
-func (s *DatabaseService) DeleteForTest(id uuid.UUID) error {
+func (s *DatabaseService) DeleteForTest(ctx context.Context, id uuid.UUID) error {
 	const maxAttempts = 5
 
 	deleteOnce := func() error {
 		for _, listener := range s.dbRemoveListener {
-			if err := listener.OnBeforeDatabaseRemove(id); err != nil {
+			if err := listener.OnBeforeDatabaseRemove(ctx, id); err != nil {
 				return err
 			}
 		}
@@ -286,6 +338,7 @@ func isTransientSerializationError(err error) bool {
 }
 
 func (s *DatabaseService) GetDatabase(
+	ctx context.Context,
 	user *users_models.User,
 	id uuid.UUID,
 ) (*Database, error) {
@@ -298,7 +351,7 @@ func (s *DatabaseService) GetDatabase(
 		return nil, errors.New("cannot access database without workspace")
 	}
 
-	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(*database.WorkspaceID, user)
+	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(ctx, *database.WorkspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -311,10 +364,11 @@ func (s *DatabaseService) GetDatabase(
 }
 
 func (s *DatabaseService) GetDatabasesByWorkspace(
+	ctx context.Context,
 	user *users_models.User,
 	workspaceID uuid.UUID,
 ) ([]*Database, error) {
-	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(workspaceID, user)
+	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(ctx, workspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -331,16 +385,17 @@ func (s *DatabaseService) GetDatabasesByWorkspace(
 		database.HideSensitiveData()
 	}
 
-	s.fillPhysicalLastBackupTimes(databases)
+	s.fillPhysicalLastBackupTimes(ctx, databases)
 
 	return databases, nil
 }
 
 func (s *DatabaseService) IsNotifierUsing(
+	ctx context.Context,
 	user *users_models.User,
 	notifierID uuid.UUID,
 ) (bool, error) {
-	_, err := s.notifierService.GetNotifier(user, notifierID)
+	_, err := s.notifierService.GetNotifier(ctx, user, notifierID)
 	if err != nil {
 		return false, err
 	}
@@ -349,10 +404,11 @@ func (s *DatabaseService) IsNotifierUsing(
 }
 
 func (s *DatabaseService) CountDatabasesByNotifier(
+	ctx context.Context,
 	user *users_models.User,
 	notifierID uuid.UUID,
 ) (int, error) {
-	_, err := s.notifierService.GetNotifier(user, notifierID)
+	_, err := s.notifierService.GetNotifier(ctx, user, notifierID)
 	if err != nil {
 		return 0, err
 	}
@@ -366,6 +422,7 @@ func (s *DatabaseService) CountDatabasesByNotifier(
 }
 
 func (s *DatabaseService) TestDatabaseConnection(
+	ctx context.Context,
 	user *users_models.User,
 	databaseID uuid.UUID,
 ) error {
@@ -378,7 +435,7 @@ func (s *DatabaseService) TestDatabaseConnection(
 		return errors.New("cannot test connection for database without workspace")
 	}
 
-	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(*database.WorkspaceID, user)
+	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(ctx, *database.WorkspaceID, user)
 	if err != nil {
 		return err
 	}
@@ -386,12 +443,24 @@ func (s *DatabaseService) TestDatabaseConnection(
 		return errors.New("insufficient permissions to test connection for this database")
 	}
 
-	err = database.TestConnection(s.logger, s.fieldEncryptor)
+	logger := s.logger.With("database_id", database.ID)
+
+	tunneledDatabase, err := OpenTunnel(ctx, OpenTunnelSpec{
+		Database:  database,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
 	if err != nil {
-		lastSaveError := err.Error()
-		database.LastBackupErrorMessage = &lastSaveError
 		return err
 	}
+
+	defer tunneledDatabase.Close()
+
+	if err := tunneledDatabase.GetDatabaseThroughTunnel().TestConnection(logger, s.fieldEncryptor); err != nil {
+		return err
+	}
+
+	tunneledDatabase.CopyDiscoveredMetadataToOriginal()
 
 	database.LastBackupErrorMessage = nil
 
@@ -404,14 +473,23 @@ func (s *DatabaseService) TestDatabaseConnection(
 }
 
 func (s *DatabaseService) TestDatabaseConnectionDirect(
+	ctx context.Context,
+	user *users_models.User,
 	database *Database,
 ) error {
-	usingDatabase, err := s.resolveConnectionTarget(database)
+	usingDatabase, err := s.resolveAuthorizedConnectionTarget(ctx, user, database)
 	if err != nil {
 		return err
 	}
 
-	return usingDatabase.TestConnection(s.logger, s.fieldEncryptor)
+	return s.testDatabaseConnection(ctx, usingDatabase)
+}
+
+func (s *DatabaseService) TestTrustedDatabaseConnection(
+	ctx context.Context,
+	database *Database,
+) error {
+	return s.testDatabaseConnection(ctx, database)
 }
 
 func (s *DatabaseService) GetDatabaseByID(
@@ -456,6 +534,7 @@ func (s *DatabaseService) SetLastBackupTime(databaseID uuid.UUID, backupTime tim
 }
 
 func (s *DatabaseService) CopyDatabase(
+	ctx context.Context,
 	user *users_models.User,
 	databaseID uuid.UUID,
 ) (*Database, error) {
@@ -468,7 +547,7 @@ func (s *DatabaseService) CopyDatabase(
 		return nil, errors.New("cannot copy database without workspace")
 	}
 
-	canManage, err := s.workspaceService.CanUserManageDBs(*existingDatabase.WorkspaceID, user)
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, *existingDatabase.WorkspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -476,99 +555,8 @@ func (s *DatabaseService) CopyDatabase(
 		return nil, errors.New("insufficient permissions to copy this database")
 	}
 
-	newDatabase := &Database{
-		ID:                     uuid.Nil,
-		WorkspaceID:            existingDatabase.WorkspaceID,
-		Name:                   existingDatabase.Name + " (Copy)",
-		Type:                   existingDatabase.Type,
-		Notifiers:              existingDatabase.Notifiers,
-		LastBackupTime:         nil,
-		LastBackupErrorMessage: nil,
-		HealthStatus:           existingDatabase.HealthStatus,
-	}
-
-	switch existingDatabase.Type {
-	case DatabaseTypePostgresLogical:
-		if existingDatabase.PostgresqlLogical != nil {
-			newDatabase.PostgresqlLogical = &postgresql_logical.PostgresqlLogicalDatabase{
-				ID:             uuid.Nil,
-				DatabaseID:     nil,
-				Version:        existingDatabase.PostgresqlLogical.Version,
-				Host:           existingDatabase.PostgresqlLogical.Host,
-				Port:           existingDatabase.PostgresqlLogical.Port,
-				Username:       existingDatabase.PostgresqlLogical.Username,
-				Password:       existingDatabase.PostgresqlLogical.Password,
-				Database:       existingDatabase.PostgresqlLogical.Database,
-				SslMode:        existingDatabase.PostgresqlLogical.SslMode,
-				SslClientCert:  existingDatabase.PostgresqlLogical.SslClientCert,
-				SslClientKey:   existingDatabase.PostgresqlLogical.SslClientKey,
-				SslRootCert:    existingDatabase.PostgresqlLogical.SslRootCert,
-				IncludeSchemas: existingDatabase.PostgresqlLogical.IncludeSchemas,
-				CpuCount:       existingDatabase.PostgresqlLogical.CpuCount,
-			}
-		}
-	case DatabaseTypePostgresPhysical:
-		if existingDatabase.PostgresqlPhysical != nil {
-			newDatabase.PostgresqlPhysical = &postgresql_physical.PostgresqlPhysicalDatabase{
-				ID:            uuid.Nil,
-				DatabaseID:    nil,
-				Version:       existingDatabase.PostgresqlPhysical.Version,
-				BackupType:    existingDatabase.PostgresqlPhysical.BackupType,
-				Host:          existingDatabase.PostgresqlPhysical.Host,
-				Port:          existingDatabase.PostgresqlPhysical.Port,
-				Username:      existingDatabase.PostgresqlPhysical.Username,
-				Password:      existingDatabase.PostgresqlPhysical.Password,
-				SslMode:       existingDatabase.PostgresqlPhysical.SslMode,
-				SslClientCert: existingDatabase.PostgresqlPhysical.SslClientCert,
-				SslClientKey:  existingDatabase.PostgresqlPhysical.SslClientKey,
-				SslRootCert:   existingDatabase.PostgresqlPhysical.SslRootCert,
-			}
-		}
-	case DatabaseTypeMysql:
-		if existingDatabase.Mysql != nil {
-			newDatabase.Mysql = &mysql.MysqlDatabase{
-				ID:         uuid.Nil,
-				DatabaseID: nil,
-				Version:    existingDatabase.Mysql.Version,
-				Host:       existingDatabase.Mysql.Host,
-				Port:       existingDatabase.Mysql.Port,
-				Username:   existingDatabase.Mysql.Username,
-				Password:   existingDatabase.Mysql.Password,
-				Database:   existingDatabase.Mysql.Database,
-				IsHttps:    existingDatabase.Mysql.IsHttps,
-			}
-		}
-	case DatabaseTypeMariadb:
-		if existingDatabase.Mariadb != nil {
-			newDatabase.Mariadb = &mariadb.MariadbDatabase{
-				ID:         uuid.Nil,
-				DatabaseID: nil,
-				Version:    existingDatabase.Mariadb.Version,
-				Host:       existingDatabase.Mariadb.Host,
-				Port:       existingDatabase.Mariadb.Port,
-				Username:   existingDatabase.Mariadb.Username,
-				Password:   existingDatabase.Mariadb.Password,
-				Database:   existingDatabase.Mariadb.Database,
-				IsHttps:    existingDatabase.Mariadb.IsHttps,
-			}
-		}
-	case DatabaseTypeMongodb:
-		if existingDatabase.Mongodb != nil {
-			newDatabase.Mongodb = &mongodb.MongodbDatabase{
-				ID:           uuid.Nil,
-				DatabaseID:   nil,
-				Version:      existingDatabase.Mongodb.Version,
-				Host:         existingDatabase.Mongodb.Host,
-				Port:         existingDatabase.Mongodb.Port,
-				Username:     existingDatabase.Mongodb.Username,
-				Password:     existingDatabase.Mongodb.Password,
-				Database:     existingDatabase.Mongodb.Database,
-				AuthDatabase: existingDatabase.Mongodb.AuthDatabase,
-				IsHttps:      existingDatabase.Mongodb.IsHttps,
-				CpuCount:     existingDatabase.Mongodb.CpuCount,
-			}
-		}
-	}
+	newDatabase := existingDatabase.CopyForNewDatabase()
+	newDatabase.Name = existingDatabase.Name + " (Copy)"
 
 	if err := newDatabase.Validate(); err != nil {
 		return nil, err
@@ -580,23 +568,24 @@ func (s *DatabaseService) CopyDatabase(
 	}
 
 	for _, listener := range s.dbCreationListener {
-		listener.OnDatabaseCreated(copiedDatabase.ID)
+		listener.OnDatabaseCreated(ctx, copiedDatabase.ID)
 	}
 
 	for _, listener := range s.dbCopyListener {
-		listener.OnDatabaseCopied(databaseID, copiedDatabase.ID)
+		listener.OnDatabaseCopied(ctx, databaseID, copiedDatabase.ID)
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database copied: %s to %s", existingDatabase.Name, copiedDatabase.Name),
-		&user.ID,
-		existingDatabase.WorkspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message:     fmt.Sprintf("Database copied: %s to %s", existingDatabase.Name, copiedDatabase.Name),
+		UserID:      &user.ID,
+		WorkspaceID: existingDatabase.WorkspaceID,
+	})
 
 	return copiedDatabase, nil
 }
 
 func (s *DatabaseService) TransferDatabaseToWorkspace(
+	ctx context.Context,
 	databaseID uuid.UUID,
 	targetWorkspaceID uuid.UUID,
 ) error {
@@ -623,12 +612,16 @@ func (s *DatabaseService) TransferDatabaseToWorkspace(
 		return fmt.Errorf("failed to get target workspace: %w", err)
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database transferred: %s from workspace '%s' to workspace '%s'",
-			database.Name, sourceWorkspace.Name, targetWorkspace.Name),
-		nil,
-		&targetWorkspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message: fmt.Sprintf(
+			"Database transferred: %s from workspace '%s' to workspace '%s'",
+			database.Name,
+			sourceWorkspace.Name,
+			targetWorkspace.Name,
+		),
+		UserID:      nil,
+		WorkspaceID: &targetWorkspaceID,
+	})
 
 	return nil
 }
@@ -682,7 +675,8 @@ func (s *DatabaseService) OnBeforeWorkspaceDeletion(workspaceID uuid.UUID) error
 	return nil
 }
 
-func (s *DatabaseService) IsUserReadOnly(
+func (s *DatabaseService) ShouldSuggestReadOnlyUser(
+	ctx context.Context,
 	user *users_models.User,
 	database *Database,
 ) (bool, []string, error) {
@@ -699,6 +693,7 @@ func (s *DatabaseService) IsUserReadOnly(
 		}
 
 		canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(
+			ctx,
 			*existingDatabase.WorkspaceID,
 			user,
 		)
@@ -723,6 +718,7 @@ func (s *DatabaseService) IsUserReadOnly(
 	} else {
 		if database.WorkspaceID != nil {
 			canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(
+				ctx,
 				*database.WorkspaceID,
 				user,
 			)
@@ -737,13 +733,27 @@ func (s *DatabaseService) IsUserReadOnly(
 		usingDatabase = database
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	tunnelCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	return usingDatabase.IsUserReadOnly(ctx, s.logger, s.fieldEncryptor)
+	logger := s.logger.With("database_id", usingDatabase.ID)
+
+	tunneledDatabase, err := OpenTunnel(tunnelCtx, OpenTunnelSpec{
+		Database:  usingDatabase,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
+	if err != nil {
+		return false, nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	return tunneledDatabase.GetDatabaseThroughTunnel().ShouldSuggestReadOnlyUser(tunnelCtx, logger, s.fieldEncryptor)
 }
 
 func (s *DatabaseService) CreateReadOnlyUser(
+	ctx context.Context,
 	user *users_models.User,
 	database *Database,
 ) (string, string, error) {
@@ -759,7 +769,7 @@ func (s *DatabaseService) CreateReadOnlyUser(
 			return "", "", errors.New("cannot create user for database without workspace")
 		}
 
-		canManage, err := s.workspaceService.CanUserManageDBs(*existingDatabase.WorkspaceID, user)
+		canManage, err := s.workspaceService.CanUserManageDBs(ctx, *existingDatabase.WorkspaceID, user)
 		if err != nil {
 			return "", "", err
 		}
@@ -780,7 +790,7 @@ func (s *DatabaseService) CreateReadOnlyUser(
 		usingDatabase = existingDatabase
 	} else {
 		if database.WorkspaceID != nil {
-			canManage, err := s.workspaceService.CanUserManageDBs(*database.WorkspaceID, user)
+			canManage, err := s.workspaceService.CanUserManageDBs(ctx, *database.WorkspaceID, user)
 			if err != nil {
 				return "", "", err
 			}
@@ -792,28 +802,45 @@ func (s *DatabaseService) CreateReadOnlyUser(
 		usingDatabase = database
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// MySQL and MariaDB commit CREATE USER and each GRANT implicitly, so their transaction cannot
+	// roll a half-granted user back. WithoutCancel keeps the request_id while stopping a client
+	// disconnect from cutting the sequence in half.
+	tunnelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
+	logger := s.logger.With("database_id", usingDatabase.ID)
+
+	tunneledDatabase, err := OpenTunnel(tunnelCtx, OpenTunnelSpec{
+		Database:  usingDatabase,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
+	if err != nil {
+		return "", "", err
+	}
+
+	defer tunneledDatabase.Close()
+
+	databaseThroughTunnel := tunneledDatabase.GetDatabaseThroughTunnel()
+
 	var username, password string
-	var err error
 
 	switch usingDatabase.Type {
 	case DatabaseTypePostgresLogical:
-		username, password, err = usingDatabase.PostgresqlLogical.CreateReadOnlyUser(
-			ctx, s.logger, s.fieldEncryptor,
+		username, password, err = databaseThroughTunnel.PostgresqlLogical.CreateReadOnlyUser(
+			tunnelCtx, logger, s.fieldEncryptor,
 		)
 	case DatabaseTypeMysql:
-		username, password, err = usingDatabase.Mysql.CreateReadOnlyUser(
-			ctx, s.logger, s.fieldEncryptor,
+		username, password, err = databaseThroughTunnel.Mysql.CreateReadOnlyUser(
+			tunnelCtx, logger, s.fieldEncryptor,
 		)
 	case DatabaseTypeMariadb:
-		username, password, err = usingDatabase.Mariadb.CreateReadOnlyUser(
-			ctx, s.logger, s.fieldEncryptor,
+		username, password, err = databaseThroughTunnel.Mariadb.CreateReadOnlyUser(
+			tunnelCtx, logger, s.fieldEncryptor,
 		)
 	case DatabaseTypeMongodb:
-		username, password, err = usingDatabase.Mongodb.CreateReadOnlyUser(
-			ctx, s.logger, s.fieldEncryptor,
+		username, password, err = databaseThroughTunnel.Mongodb.CreateReadOnlyUser(
+			tunnelCtx, logger, s.fieldEncryptor,
 		)
 	default:
 		return "", "", errors.New("read-only user creation not supported for this database type")
@@ -824,63 +851,64 @@ func (s *DatabaseService) CreateReadOnlyUser(
 	}
 
 	if usingDatabase.WorkspaceID != nil {
-		s.auditLogService.WriteAuditLog(
-			fmt.Sprintf(
+		s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+			Message: fmt.Sprintf(
 				"Read-only user created for database: %s (username: %s)",
 				usingDatabase.Name,
 				username,
 			),
-			&user.ID,
-			usingDatabase.WorkspaceID,
-		)
+			UserID:      &user.ID,
+			WorkspaceID: usingDatabase.WorkspaceID,
+		})
 	}
 
 	return username, password, nil
 }
 
 func (s *DatabaseService) CreateReplicationOnlyUser(
+	ctx context.Context,
 	user *users_models.User,
 	database *Database,
-) (string, string, error) {
+) (*postgresql_physical.ReplicationOnlyUser, error) {
 	var usingDatabase *Database
 
 	if database.ID != uuid.Nil {
 		existingDatabase, err := s.dbRepository.FindByID(database.ID)
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
 
 		if existingDatabase.WorkspaceID == nil {
-			return "", "", errors.New("cannot create user for database without workspace")
+			return nil, errors.New("cannot create user for database without workspace")
 		}
 
-		canManage, err := s.workspaceService.CanUserManageDBs(*existingDatabase.WorkspaceID, user)
+		canManage, err := s.workspaceService.CanUserManageDBs(ctx, *existingDatabase.WorkspaceID, user)
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
 		if !canManage {
-			return "", "", errors.New("insufficient permissions to manage this database")
+			return nil, errors.New("insufficient permissions to manage this database")
 		}
 
 		if database.WorkspaceID != nil && *existingDatabase.WorkspaceID != *database.WorkspaceID {
-			return "", "", errors.New("database does not belong to this workspace")
+			return nil, errors.New("database does not belong to this workspace")
 		}
 
 		existingDatabase.Update(database)
 
 		if err := existingDatabase.Validate(); err != nil {
-			return "", "", err
+			return nil, err
 		}
 
 		usingDatabase = existingDatabase
 	} else {
 		if database.WorkspaceID != nil {
-			canManage, err := s.workspaceService.CanUserManageDBs(*database.WorkspaceID, user)
+			canManage, err := s.workspaceService.CanUserManageDBs(ctx, *database.WorkspaceID, user)
 			if err != nil {
-				return "", "", err
+				return nil, err
 			}
 			if !canManage {
-				return "", "", errors.New("insufficient permissions to manage this workspace")
+				return nil, errors.New("insufficient permissions to manage this workspace")
 			}
 		}
 
@@ -888,45 +916,78 @@ func (s *DatabaseService) CreateReplicationOnlyUser(
 	}
 
 	if usingDatabase.Type != DatabaseTypePostgresPhysical {
-		return "", "", errors.New(
+		return nil, errors.New(
 			"replication-only user creation is only supported for POSTGRES_PHYSICAL databases",
 		)
 	}
 
 	if usingDatabase.PostgresqlPhysical == nil {
-		return "", "", errors.New("physical database details are missing")
+		return nil, errors.New("physical database details are missing")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	tunnelCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	username, password, err := usingDatabase.PostgresqlPhysical.CreateReplicationOnlyUser(
-		ctx, s.logger, s.fieldEncryptor,
-	)
+	logger := s.logger.With("database_id", usingDatabase.ID)
+
+	tunneledDatabase, err := OpenTunnel(tunnelCtx, OpenTunnelSpec{
+		Database:  usingDatabase,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
 	if err != nil {
-		return "", "", err
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	createdUser, err := tunneledDatabase.GetDatabaseThroughTunnel().
+		PostgresqlPhysical.CreateReplicationOnlyUser(tunnelCtx, logger, s.fieldEncryptor)
+	if err != nil {
+		return nil, err
 	}
 
 	if usingDatabase.WorkspaceID != nil {
-		s.auditLogService.WriteAuditLog(
-			fmt.Sprintf(
+		s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+			Message: fmt.Sprintf(
 				"Replication-only user created for database: %s (username: %s)",
 				usingDatabase.Name,
-				username,
+				createdUser.Username,
 			),
-			&user.ID,
-			usingDatabase.WorkspaceID,
-		)
+			UserID:      &user.ID,
+			WorkspaceID: usingDatabase.WorkspaceID,
+		})
 	}
 
-	return username, password, nil
+	return createdUser, nil
+}
+
+func (s *DatabaseService) testDatabaseConnection(ctx context.Context, database *Database) error {
+	if database == nil {
+		return errors.New("database is required")
+	}
+
+	logger := s.logger.With("database_id", database.ID)
+
+	tunneledDatabase, err := OpenTunnel(ctx, OpenTunnelSpec{
+		Database:  database,
+		Logger:    logger,
+		Encryptor: s.fieldEncryptor,
+	})
+	if err != nil {
+		return err
+	}
+
+	defer tunneledDatabase.Close()
+
+	return tunneledDatabase.GetDatabaseThroughTunnel().TestConnection(logger, s.fieldEncryptor)
 }
 
 // fillPhysicalLastBackupTimes populates LastBackupTime for physical databases,
 // whose backups (FULL / INCREMENTAL / WAL) live outside the databases table and so
 // are not denormalized onto the row the way logical backups are. A failure here is
 // non-fatal: the list must still render, just without the last-backup decoration.
-func (s *DatabaseService) fillPhysicalLastBackupTimes(databases []*Database) {
+func (s *DatabaseService) fillPhysicalLastBackupTimes(ctx context.Context, databases []*Database) {
 	var physicalDatabaseIDs []uuid.UUID
 
 	for _, database := range databases {
@@ -941,7 +1002,7 @@ func (s *DatabaseService) fillPhysicalLastBackupTimes(databases []*Database) {
 
 	lastBackupTimes, err := s.physicalBackupService.GetLastBackupTimesByDatabaseIDs(physicalDatabaseIDs)
 	if err != nil {
-		s.logger.Error("failed to load physical last backup times", "error", err)
+		s.logger.ErrorContext(ctx, "failed to load physical last backup times", "error", err)
 
 		return
 	}
@@ -953,16 +1014,50 @@ func (s *DatabaseService) fillPhysicalLastBackupTimes(databases []*Database) {
 	}
 }
 
-// resolveConnectionTarget merges an unsaved request over the persisted database
-// when an ID is supplied, so a connection test uses the same merge rules as save.
-func (s *DatabaseService) resolveConnectionTarget(database *Database) (*Database, error) {
+func (s *DatabaseService) resolveAuthorizedConnectionTarget(
+	ctx context.Context,
+	user *users_models.User,
+	database *Database,
+) (*Database, error) {
+	if database == nil {
+		return nil, errors.New("database is required")
+	}
+
 	if database.ID == uuid.Nil {
+		if database.WorkspaceID == nil {
+			return nil, errors.New("workspaceId is required")
+		}
+
+		canManage, err := s.workspaceService.CanUserManageDBs(ctx, *database.WorkspaceID, user)
+		if err != nil {
+			return nil, errors.Join(ErrDatabaseConnectionAuthorizationLookup, err)
+		}
+		if !canManage {
+			return nil, ErrInsufficientPermissionsToTestDatabaseConnection
+		}
+
 		return database, nil
 	}
 
 	existingDatabase, err := s.dbRepository.FindByID(database.ID)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrInsufficientPermissionsToTestDatabaseConnection
+		}
+
+		return nil, errors.Join(ErrDatabaseConnectionTargetLookup, err)
+	}
+
+	if existingDatabase.WorkspaceID == nil {
+		return nil, ErrInsufficientPermissionsToTestDatabaseConnection
+	}
+
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, *existingDatabase.WorkspaceID, user)
+	if err != nil {
+		return nil, errors.Join(ErrDatabaseConnectionAuthorizationLookup, err)
+	}
+	if !canManage {
+		return nil, ErrInsufficientPermissionsToTestDatabaseConnection
 	}
 
 	if database.WorkspaceID != nil && existingDatabase.WorkspaceID != nil &&
@@ -977,4 +1072,12 @@ func (s *DatabaseService) resolveConnectionTarget(database *Database) (*Database
 	}
 
 	return existingDatabase, nil
+}
+
+func getPhysicalBackupType(database *Database) postgresql_physical.BackupType {
+	if database.PostgresqlPhysical == nil {
+		return ""
+	}
+
+	return database.PostgresqlPhysical.BackupType
 }

@@ -4,15 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
-	"time"
 
 	backuping_logical "databasus-backend/internal/features/backups/backups/backuping/logical"
 	"databasus-backend/internal/features/disk"
 	verification_agents "databasus-backend/internal/features/verification/agents"
 	verification_runs "databasus-backend/internal/features/verification/runs"
 	"databasus-backend/internal/storage"
-	cache_utils "databasus-backend/internal/util/cache"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -20,29 +19,27 @@ type HealthcheckService struct {
 	diskService             *disk.DiskService
 	backupBackgroundService *backuping_logical.BackupsScheduler
 	agentService            *verification_agents.AgentService
+	logger                  *slog.Logger
 }
 
-func (s *HealthcheckService) IsHealthy() error {
-	return s.performHealthCheck()
+func (s *HealthcheckService) IsHealthy(ctx context.Context) error {
+	return s.performHealthCheck(ctx)
 }
 
-func (s *HealthcheckService) performHealthCheck() error {
-	// Check if cache is available with PING
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	client := cache_utils.GetValkeyClient()
-	pingResult := client.Do(ctx, client.B().Ping().Build())
-	if pingResult.Error() != nil {
-		return errors.New("cannot connect to valkey")
-	}
-
-	diskUsage, err := s.diskService.GetDiskUsage()
+// Each branch is a degradation the probe exists to surface. Returning the reason to the caller only
+// answers "is it healthy now"; logging it is what leaves a history to read afterwards.
+func (s *HealthcheckService) performHealthCheck(ctx context.Context) error {
+	diskUsage, err := s.diskService.GetDiskUsage(ctx)
 	if err != nil {
+		s.logger.WarnContext(ctx, "healthcheck degraded: cannot get disk usage", "error", err)
+
 		return errors.New("cannot get disk usage")
 	}
 
 	if float64(diskUsage.UsedSpaceBytes) >= float64(diskUsage.TotalSpaceBytes)*0.95 {
+		s.logger.WarnContext(ctx, fmt.Sprintf("healthcheck degraded: %.1f%% of the disk is used",
+			float64(diskUsage.UsedSpaceBytes)/float64(diskUsage.TotalSpaceBytes)*100))
+
 		return errors.New("more than 95% of the disk is used")
 	}
 
@@ -53,15 +50,21 @@ func (s *HealthcheckService) performHealthCheck() error {
 	db := storage.GetDb()
 	err = db.Raw("SELECT 1").Error
 	if err != nil {
+		s.logger.WarnContext(ctx, "healthcheck degraded: cannot connect to the database", "error", err)
+
 		return errors.New("cannot connect to the database")
 	}
 
 	if !s.backupBackgroundService.IsSchedulerRunning() {
+		s.logger.WarnContext(ctx, "healthcheck degraded: the backup scheduler has not ticked in 5 minutes")
+
 		return errors.New("backups are not running for more than 5 minutes")
 	}
 
 	staleAgents, err := s.agentService.GetStaleAgents(verification_runs.StaleAgentThreshold)
 	if err != nil {
+		s.logger.WarnContext(ctx, "healthcheck degraded: cannot query verification agents", "error", err)
+
 		return errors.New("cannot query verification agents")
 	}
 

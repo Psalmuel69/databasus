@@ -199,13 +199,47 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 				)
 				require.NoError(t, err, "SaveFile should succeed")
 
-				file, err := tc.storage.GetFile(encryptor, fileID.String())
+				file, err := tc.storage.GetFile(t.Context(), encryptor, logger.GetLogger(), fileID.String())
 				assert.NoError(t, err, "GetFile should succeed")
 				defer file.Close()
 
 				content, err := io.ReadAll(file)
 				assert.NoError(t, err, "Should be able to read file")
 				assert.Equal(t, fileData, content, "File content should match the original")
+			})
+
+			// Reads run through a ResumingReader that stops at the size the backend declared, so a
+			// backend reporting the wrong length truncates the download. One inline byte of test
+			// data is too small to catch that.
+			t.Run("Test_SaveAndGetLargeFile_ReturnsCompleteContent", func(t *testing.T) {
+				largeFileData := generateFileContent(256 * 1024)
+				fileID := uuid.New()
+
+				err := tc.storage.SaveFile(
+					t.Context(),
+					encryptor,
+					logger.GetLogger(),
+					fileID.String(),
+					bytes.NewReader(largeFileData),
+				)
+				require.NoError(t, err, "SaveFile should succeed")
+
+				t.Cleanup(func() {
+					_ = tc.storage.DeleteFile(t.Context(), encryptor, logger.GetLogger(), fileID.String())
+				})
+
+				file, err := tc.storage.GetFile(
+					t.Context(),
+					encryptor,
+					logger.GetLogger(),
+					fileID.String(),
+				)
+				require.NoError(t, err, "GetFile should succeed")
+				defer file.Close()
+
+				content, err := io.ReadAll(file)
+				require.NoError(t, err, "Should be able to read file")
+				assert.Equal(t, largeFileData, content, "File content should match the original")
 			})
 
 			t.Run("Test_TestDeleteFile_RemovesFileFromDisk", func(t *testing.T) {
@@ -222,10 +256,10 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 				)
 				require.NoError(t, err, "SaveFile should succeed")
 
-				err = tc.storage.DeleteFile(encryptor, fileID.String())
+				err = tc.storage.DeleteFile(t.Context(), encryptor, logger.GetLogger(), fileID.String())
 				assert.NoError(t, err, "DeleteFile should succeed")
 
-				file, err := tc.storage.GetFile(encryptor, fileID.String())
+				file, err := tc.storage.GetFile(t.Context(), encryptor, logger.GetLogger(), fileID.String())
 				assert.Error(t, err, "GetFile should fail for non-existent file")
 				if file != nil {
 					file.Close()
@@ -234,7 +268,7 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 
 			t.Run("Test_TestDeleteNonExistentFile_DoesNotError", func(t *testing.T) {
 				nonExistentID := uuid.New()
-				err := tc.storage.DeleteFile(encryptor, nonExistentID.String())
+				err := tc.storage.DeleteFile(t.Context(), encryptor, logger.GetLogger(), nonExistentID.String())
 				assert.NoError(t, err, "DeleteFile should not error for non-existent file")
 			})
 		})
@@ -243,6 +277,15 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 
 func addressOf(endpoint containers.Endpoint) string {
 	return fmt.Sprintf("%s:%d", endpoint.Host, endpoint.Port)
+}
+
+func generateFileContent(size int) []byte {
+	generated := make([]byte, size)
+	for i := range generated {
+		generated[i] = byte(i % 251)
+	}
+
+	return generated
 }
 
 func setupTestFile() (string, error) {
@@ -390,7 +433,7 @@ acl = private`, s3Container.accessKey, s3Container.endpoint),
 
 	encryptor := encryption.GetFieldEncryptor()
 
-	err = rcloneStorage.DeleteFile(encryptor, fileID)
+	err = rcloneStorage.DeleteFile(t.Context(), encryptor, logger.GetLogger(), fileID)
 	require.Error(t, err)
 
 	_, statErr := minioClient.StatObject(

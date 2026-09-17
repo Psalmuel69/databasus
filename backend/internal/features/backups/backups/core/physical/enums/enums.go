@@ -38,12 +38,13 @@ const (
 	PhysicalBackupErrorApplicationRestart       PhysicalBackupErrorReason = "APPLICATION_RESTART"
 	PhysicalBackupErrorSystemIdentifierMismatch PhysicalBackupErrorReason = "SYSTEM_IDENTIFIER_MISMATCH"
 	PhysicalBackupErrorTimelineRegression       PhysicalBackupErrorReason = "TIMELINE_REGRESSION"
+	PhysicalBackupErrorTimelineSwitchDetected   PhysicalBackupErrorReason = "TIMELINE_SWITCH_DETECTED"
+	PhysicalBackupErrorFailoverDuringBackup     PhysicalBackupErrorReason = "FAILOVER_DURING_BACKUP"
 	PhysicalBackupErrorManifestCorrupted        PhysicalBackupErrorReason = "MANIFEST_CORRUPTED"
 	PhysicalBackupErrorStartLsnOutsideTimeline  PhysicalBackupErrorReason = "START_LSN_OUTSIDE_TIMELINE_RANGE"
 
 	// Covers both an explicit user cancel on an in-flight backup AND
-	// in-flight backups cancelled by OnBackupConfigChanged when the user
-	// disables backups or demotes BackupType.
+	// in-flight backups cancelled when the user disables backups.
 	PhysicalBackupErrorCanceledByUser PhysicalBackupErrorReason = "CANCELED_BY_USER"
 
 	// In-flight backup killed because the parent DB was removed via
@@ -53,15 +54,15 @@ const (
 	// between the CANCEL and the DROP.
 	PhysicalBackupErrorCanceledByDbRemoval PhysicalBackupErrorReason = "CANCELED_BY_DB_REMOVAL"
 
-	// INCR-specific (all chain-killing, status = CHAIN_BROKEN).
+	// INCR-specific and chain-killing (status = CHAIN_BROKEN).
 	PhysicalBackupErrorSummariesExpired      PhysicalBackupErrorReason = "SUMMARIES_EXPIRED"
 	PhysicalBackupErrorSummarizerOff         PhysicalBackupErrorReason = "SUMMARIZER_OFF"
 	PhysicalBackupErrorParentManifestMissing PhysicalBackupErrorReason = "PARENT_MANIFEST_MISSING"
 
-	// The summarizer is on and covers the parent, but trails current WAL by
-	// more than the lag threshold (or stayed behind for the whole bounded
-	// wait): pushing an INCR would race a moving target, so the chain is closed
-	// and the next tick opens a fresh FULL.
+	// INCR-specific and transient (status = ERROR): the summarizer is on and
+	// covers the parent, but its process is not publishing summaries. The chain
+	// stays extendable and the next cadence tick retries it; only a run of
+	// consecutive failures closes the chain.
 	PhysicalBackupErrorSummarizerFallingBehind PhysicalBackupErrorReason = "SUMMARIZER_FALLING_BEHIND"
 )
 

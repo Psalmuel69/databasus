@@ -27,6 +27,9 @@ var (
 	ErrStorageHasAttachedDatabases = errors.New(
 		"storage has attached databases and cannot be deleted",
 	)
+	ErrStorageHasBackups = errors.New(
+		"storage still holds backups; delete them first, they are the only record of the files they name",
+	)
 	ErrStorageHasAttachedDatabasesCannotTransfer = errors.New(
 		"storage has attached databases and cannot be transferred",
 	)

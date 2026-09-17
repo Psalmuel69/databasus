@@ -80,6 +80,12 @@ func (r *PhysicalWalSegmentRepository) FindByChainSpan(
 
 // Anti-join not covered by idx_physical_wal_segments_database_id_received_at;
 // expect a seq scan on physical_full_backups when invoked in bulk.
+//
+// The comparison anchors on the segment's end_lsn because a FULL's start_lsn is
+// a real recovery position a short way inside the segment that holds it, while a
+// segment's own bounds are derived from its filename and are file-aligned.
+// Comparing against start_lsn would classify that boundary segment as an orphan
+// and delete the WAL the FULL itself starts and stops in.
 func (r *PhysicalWalSegmentRepository) FindOrphans(
 	databaseID uuid.UUID,
 ) ([]*physical_models.PhysicalWalSegment, error) {
@@ -97,7 +103,7 @@ func (r *PhysicalWalSegmentRepository) FindOrphans(
 			    WHERE f.database_id = w.database_id
 			      AND f.timeline_id = w.timeline_id
 			      AND f.start_lsn IS NOT NULL
-			      AND f.start_lsn <= w.start_lsn
+			      AND f.start_lsn < w.end_lsn
 			      AND f.status = ?
 			  )
 			ORDER BY w.start_lsn ASC
@@ -113,10 +119,9 @@ func (r *PhysicalWalSegmentRepository) DeleteByID(id uuid.UUID) error {
 	return storage.GetDb().Delete(&physical_models.PhysicalWalSegment{}, "id = ?", id).Error
 }
 
-// DeleteAbandonedClaims removes insert-first WAL claim rows whose upload never
-// finished (file_name still NULL) and that have aged past the grace period. A
-// NULL file_name is proof no bytes were ever written under any name, so there
-// is no storage object to delete. Returns the number of rows removed.
+// A NULL file_name does not prove the upload wrote nothing: the object is written
+// before the row names it. The bytes such a claim may have left are owned by their
+// own pending deletion, so this only removes the aged-out claim row.
 func (r *PhysicalWalSegmentRepository) DeleteAbandonedClaims(
 	databaseID uuid.UUID,
 	olderThan time.Time,
@@ -194,26 +199,29 @@ func (r *PhysicalWalSegmentRepository) FindByChainKey(
 	return &segment, nil
 }
 
-// MarkUploaded flips file_name from NULL to the durable object key, guarded by
-// file_name IS NULL so a DeleteFull cascade that removed the claim mid-upload
-// makes this a no-op. updated=true means the upload is durably committed;
-// updated=false means the NULL claim no longer exists (cascade caught it) and the
-// caller must DeleteFile the now-orphaned storage object.
-func (r *PhysicalWalSegmentRepository) MarkUploaded(
-	id uuid.UUID,
-	fileName string,
-	compressedSizeMb float64,
-	encryptionSalt, encryptionIV *string,
+type WalSegmentUpload struct {
+	SegmentID        uuid.UUID
+	FileName         string
+	CompressedSizeMb float64
+	EncryptionSalt   *string
+	EncryptionIV     *string
+}
+
+// The file_name IS NULL guard makes this a no-op when a DeleteFull cascade removed
+// the claim mid-upload. An updated=false result therefore means nothing published
+// the object, and the caller hands it back through the file store.
+func (r *PhysicalWalSegmentRepository) MarkUploadedInTransaction(
+	tx *gorm.DB,
+	upload WalSegmentUpload,
 ) (updated bool, err error) {
-	result := storage.
-		GetDb().
+	result := tx.
 		Model(&physical_models.PhysicalWalSegment{}).
-		Where("id = ? AND file_name IS NULL", id).
+		Where("id = ? AND file_name IS NULL", upload.SegmentID).
 		Updates(map[string]any{
-			"file_name":          fileName,
-			"compressed_size_mb": compressedSizeMb,
-			"encryption_salt":    encryptionSalt,
-			"encryption_iv":      encryptionIV,
+			"file_name":          upload.FileName,
+			"compressed_size_mb": upload.CompressedSizeMb,
+			"encryption_salt":    upload.EncryptionSalt,
+			"encryption_iv":      upload.EncryptionIV,
 		})
 	if result.Error != nil {
 		return false, result.Error

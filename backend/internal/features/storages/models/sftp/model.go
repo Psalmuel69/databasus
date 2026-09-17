@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"databasus-backend/internal/util/encryption"
+	io_utils "databasus-backend/internal/util/io"
 )
 
 const (
@@ -51,27 +53,29 @@ func (s *SFTPStorage) SaveFile(
 	default:
 	}
 
-	logger.Info("Starting to save file to SFTP storage", "fileName", fileName, "host", s.Host)
+	logger.InfoContext(ctx, "starting to save file to SFTP storage", "file_name", fileName, "host", s.Host)
 
 	client, sshConn, err := s.connect(encryptor, sftpConnectTimeout)
 	if err != nil {
-		logger.Error("Failed to connect to SFTP", "fileName", fileName, "error", err)
+		logger.ErrorContext(ctx, "failed to connect to SFTP", "file_name", fileName, "error", err)
 		return fmt.Errorf("failed to connect to SFTP: %w", err)
 	}
 	defer func() {
 		if closeErr := client.Close(); closeErr != nil {
-			logger.Error(
-				"Failed to close SFTP client",
-				"fileName",
+			logger.ErrorContext(
+				ctx,
+				"failed to close SFTP client",
+				"file_name",
 				fileName,
 				"error",
 				closeErr,
 			)
 		}
 		if closeErr := sshConn.Close(); closeErr != nil {
-			logger.Error(
-				"Failed to close SSH connection",
-				"fileName",
+			logger.ErrorContext(
+				ctx,
+				"failed to close SSH connection",
+				"file_name",
 				fileName,
 				"error",
 				closeErr,
@@ -81,9 +85,10 @@ func (s *SFTPStorage) SaveFile(
 
 	if s.Path != "" {
 		if err := s.ensureDirectory(client, s.Path); err != nil {
-			logger.Error(
-				"Failed to ensure directory",
-				"fileName",
+			logger.ErrorContext(
+				ctx,
+				"failed to ensure directory",
+				"file_name",
 				fileName,
 				"path",
 				s.Path,
@@ -95,11 +100,11 @@ func (s *SFTPStorage) SaveFile(
 	}
 
 	filePath := s.getFilePath(fileName)
-	logger.Debug("Uploading file to SFTP", "fileName", fileName, "filePath", filePath)
+	logger.DebugContext(ctx, "uploading file to SFTP", "file_name", fileName, "file_path", filePath)
 
 	remoteFile, err := client.Create(filePath)
 	if err != nil {
-		logger.Error("Failed to create remote file", "fileName", fileName, "error", err)
+		logger.ErrorContext(ctx, "failed to create remote file", "file_name", fileName, "error", err)
 		return fmt.Errorf("failed to create remote file: %w", err)
 	}
 	defer func() {
@@ -112,26 +117,29 @@ func (s *SFTPStorage) SaveFile(
 	if err != nil {
 		select {
 		case <-ctx.Done():
-			logger.Info("SFTP upload cancelled", "fileName", fileName)
+			logger.InfoContext(ctx, "SFTP upload cancelled", "file_name", fileName)
 			return ctx.Err()
 		default:
-			logger.Error("Failed to upload file to SFTP", "fileName", fileName, "error", err)
+			logger.ErrorContext(ctx, "failed to upload file to SFTP", "file_name", fileName, "error", err)
 			return fmt.Errorf("failed to upload file to SFTP: %w", err)
 		}
 	}
 
-	logger.Info(
-		"Successfully saved file to SFTP storage",
-		"fileName",
+	logger.InfoContext(
+		ctx,
+		"successfully saved file to SFTP storage",
+		"file_name",
 		fileName,
-		"filePath",
+		"file_path",
 		filePath,
 	)
 	return nil
 }
 
 func (s *SFTPStorage) GetFile(
+	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
+	logger *slog.Logger,
 	fileName string,
 ) (io.ReadCloser, error) {
 	client, sshConn, err := s.connect(encryptor, sftpConnectTimeout)
@@ -141,25 +149,42 @@ func (s *SFTPStorage) GetFile(
 
 	filePath := s.getFilePath(fileName)
 
-	remoteFile, err := client.Open(filePath)
+	fileInfo, err := client.Stat(filePath)
 	if err != nil {
 		_ = client.Close()
 		_ = sshConn.Close()
-		return nil, fmt.Errorf("failed to open file from SFTP: %w", err)
+
+		return nil, fmt.Errorf("failed to stat file on SFTP: %w", err)
 	}
 
-	return &sftpFileReader{
-		file:    remoteFile,
-		client:  client,
-		sshConn: sshConn,
-	}, nil
+	totalBytes := fileInfo.Size()
+
+	_ = client.Close()
+	_ = sshConn.Close()
+
+	return io_utils.NewResumingReader(io_utils.ResumingReaderSpec{
+		StreamCtx:  ctx,
+		Logger:     logger,
+		FileName:   fileName,
+		TotalBytes: totalBytes,
+		OpenAtOffset: func(attemptCtx context.Context, offsetBytes int64) (io.ReadCloser, error) {
+			return s.openFileAtOffset(attemptCtx, encryptor, filePath, offsetBytes)
+		},
+	}), nil
 }
 
-func (s *SFTPStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), sftpDeleteTimeout)
+func (s *SFTPStorage) DeleteFile(
+	ctx context.Context,
+	encryptor encryption.FieldEncryptor,
+	logger *slog.Logger,
+	fileName string,
+) error {
+	// Deletes run from cleanup paths whose caller context is often already cancelled, so the
+	// operation carries its own deadline; the caller's ctx stays for log correlation only.
+	deleteCtx, cancel := context.WithTimeout(context.Background(), sftpDeleteTimeout)
 	defer cancel()
 
-	client, sshConn, err := s.connectWithContext(ctx, encryptor, sftpDeleteTimeout)
+	client, sshConn, err := s.connectWithContext(deleteCtx, encryptor, sftpDeleteTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to connect to SFTP: %w", err)
 	}
@@ -170,15 +195,11 @@ func (s *SFTPStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName s
 
 	filePath := s.getFilePath(fileName)
 
-	_, err = client.Stat(filePath)
-	if err != nil {
-		return nil
-	}
-
-	err = client.Remove(filePath)
-	if err != nil {
+	if err := client.Remove(filePath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("failed to delete file from SFTP: %w", err)
 	}
+
+	logger.DebugContext(ctx, "deleted file from sftp storage", "file_name", fileName)
 
 	return nil
 }
@@ -378,9 +399,10 @@ func (s *SFTPStorage) getFilePath(filename string) string {
 }
 
 type sftpFileReader struct {
-	file    *sftp.File
-	client  *sftp.Client
-	sshConn *ssh.Client
+	file              *sftp.File
+	client            *sftp.Client
+	sshConn           *ssh.Client
+	stopCloseOnCancel func() bool
 }
 
 func (r *sftpFileReader) Read(p []byte) (n int, err error) {
@@ -389,6 +411,10 @@ func (r *sftpFileReader) Read(p []byte) (n int, err error) {
 
 func (r *sftpFileReader) Close() error {
 	var errs []error
+
+	if r.stopCloseOnCancel != nil {
+		r.stopCloseOnCancel()
+	}
 
 	if r.file != nil {
 		if err := r.file.Close(); err != nil {
@@ -427,4 +453,49 @@ func (r *contextReader) Read(p []byte) (n int, err error) {
 	default:
 		return r.reader.Read(p)
 	}
+}
+
+// Each attempt dials a fresh SSH connection: a resumed read follows a dropped one, and the client
+// that carried it is no longer usable.
+func (s *SFTPStorage) openFileAtOffset(
+	attemptCtx context.Context,
+	encryptor encryption.FieldEncryptor,
+	filePath string,
+	offsetBytes int64,
+) (io.ReadCloser, error) {
+	client, sshConn, err := s.connect(encryptor, sftpConnectTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to SFTP: %w", err)
+	}
+
+	remoteFile, err := client.Open(filePath)
+	if err != nil {
+		_ = client.Close()
+		_ = sshConn.Close()
+
+		return nil, fmt.Errorf("failed to open file from SFTP: %w", err)
+	}
+
+	if offsetBytes > 0 {
+		if _, err := remoteFile.Seek(offsetBytes, io.SeekStart); err != nil {
+			_ = remoteFile.Close()
+			_ = client.Close()
+			_ = sshConn.Close()
+
+			return nil, fmt.Errorf("failed to resume SFTP read at offset %d: %w", offsetBytes, err)
+		}
+	}
+
+	// The SFTP client takes no context, so a read blocked on a silent server would ignore the
+	// caller's cancellation; closing the connection is what unblocks it.
+	stopCloseOnCancel := context.AfterFunc(attemptCtx, func() {
+		_ = sshConn.Close()
+	})
+
+	return &sftpFileReader{
+		file:              remoteFile,
+		client:            client,
+		sshConn:           sshConn,
+		stopCloseOnCancel: stopCloseOnCancel,
+	}, nil
 }

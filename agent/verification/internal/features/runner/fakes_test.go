@@ -89,7 +89,7 @@ type fakeContainer struct {
 	inContainerConn dbconn.Conn
 	verifierConn    dbconn.Conn
 	terminated      bool
-	diskUsageBytes  int64
+	diskUsageBytes  atomic.Int64
 	diskUsageErr    error
 }
 
@@ -107,7 +107,7 @@ func (c *fakeContainer) GetInContainerConn() dbconn.Conn { return c.inContainerC
 func (c *fakeContainer) GetVerifierConn() dbconn.Conn    { return c.verifierConn }
 
 func (c *fakeContainer) GetDiskUsageBytes(context.Context) (int64, error) {
-	return c.diskUsageBytes, c.diskUsageErr
+	return c.diskUsageBytes.Load(), c.diskUsageErr
 }
 
 func (c *fakeContainer) Terminate(context.Context) error {
@@ -129,18 +129,22 @@ func (s *fakeSpawner) Spawn(_ context.Context, _ SpawnRequest) (JobContainer, er
 }
 
 type fakeRestorer struct {
-	stageErr  error
-	runResult restore.Result
-	runErr    error
-	runBlocks bool
+	stageErr             error
+	ensureRolesErr       error
+	ensureRolesBlocks    bool
+	onEnsureRolesEntered func()
+	runResult            restore.Result
+	runErr               error
+	runBlocks            bool
 
 	runEntered      atomic.Bool
 	runCtxCancelled atomic.Bool
 
-	// calls records the restore-related call order ("pre", "restore", "post") for a single job.
+	// calls records the restore-related call order ("roles", "pre", "restore", "post") for a single job.
 	calls []string
 	// runParallelJobs records the -j value RunPgRestore was invoked with.
-	runParallelJobs int
+	runParallelJobs  int
+	runIsTimescaledb bool
 }
 
 func (r *fakeRestorer) StageBackupViaExec(
@@ -154,10 +158,11 @@ func (r *fakeRestorer) StageBackupViaExec(
 }
 
 func (r *fakeRestorer) RunPgRestore(
-	ctx context.Context, _ restore.ExecRunner, _ string, _ dbconn.Conn, parallelJobs int,
+	ctx context.Context, _ restore.ExecRunner, spec restore.PgRestoreSpec,
 ) (restore.Result, error) {
 	r.calls = append(r.calls, "restore")
-	r.runParallelJobs = parallelJobs
+	r.runParallelJobs = spec.ParallelJobs
+	r.runIsTimescaledb = spec.IsTimescaledb
 
 	if r.runBlocks {
 		r.runEntered.Store(true)
@@ -168,6 +173,28 @@ func (r *fakeRestorer) RunPgRestore(
 	}
 
 	return r.runResult, r.runErr
+}
+
+func (r *fakeRestorer) EnsureArchiveOwnerRoles(
+	ctx context.Context, _ restore.ExecRunner, _ string, _ dbconn.Conn,
+) ([]string, error) {
+	r.calls = append(r.calls, "roles")
+
+	if r.onEnsureRolesEntered != nil {
+		r.onEnsureRolesEntered()
+	}
+
+	if r.ensureRolesBlocks {
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	}
+
+	if r.ensureRolesErr != nil {
+		return nil, r.ensureRolesErr
+	}
+
+	return []string{"ts_app"}, nil
 }
 
 func (r *fakeRestorer) RunTimescalePreRestore(context.Context, dbconn.Conn) error {

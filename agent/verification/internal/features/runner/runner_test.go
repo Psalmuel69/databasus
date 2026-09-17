@@ -145,7 +145,7 @@ func Test_ExecuteJob_WhenDiskWatcherTrips_ReportsTerminalDiskLimitExceeded(t *te
 
 	apiClient := &fakeAPI{downloadBody: []byte("ARCHIVE")}
 	jobContainer := fakeContainerWith(testConn())
-	jobContainer.diskUsageBytes = 1 << 40
+	jobContainer.diskUsageBytes.Store(1 << 40)
 	restorer := &fakeRestorer{runBlocks: true}
 
 	r := newTestRunner(
@@ -162,10 +162,35 @@ func Test_ExecuteJob_WhenDiskWatcherTrips_ReportsTerminalDiskLimitExceeded(t *te
 	assert.True(t, jobContainer.terminated, "the container must be torn down on disk-limit abort")
 }
 
+func Test_ExecuteJob_WhenDiskWatcherTripsDuringOwnerRoles_ReportsTerminalDiskLimitExceeded(t *testing.T) {
+	originalInterval := diskWatchInterval
+	diskWatchInterval = time.Millisecond
+	t.Cleanup(func() { diskWatchInterval = originalInterval })
+
+	apiClient := &fakeAPI{downloadBody: []byte("ARCHIVE")}
+	jobContainer := fakeContainerWith(testConn())
+	restorer := &fakeRestorer{
+		ensureRolesBlocks:    true,
+		onEnsureRolesEntered: func() { jobContainer.diskUsageBytes.Store(1 << 40) },
+	}
+
+	r := newTestRunner(
+		apiClient, &fakeSpawner{container: jobContainer}, restorer, &fakeStats{}, newFakeRegistrar())
+
+	r.executeJob(t.Context(), postgresJob())
+
+	report, ok := apiClient.lastReport()
+	require.Contains(t, restorer.calls, "roles", "the watcher must trip inside the owner-roles stage")
+	require.True(t, ok, "a stage cancelled by the watcher must still post the disk verdict")
+	assert.Equal(t, api.VerificationStatusFailed, report.Status)
+	require.NotNil(t, report.FailureKind)
+	assert.Equal(t, api.FailureKindDiskLimitExceeded, *report.FailureKind)
+}
+
 func Test_ExecuteJob_WhenServerSendsNoDiskBudget_DoesNotFalselyTrip(t *testing.T) {
 	apiClient := &fakeAPI{downloadBody: []byte("ARCHIVE")}
 	jobContainer := fakeContainerWith(testConn())
-	jobContainer.diskUsageBytes = 1 << 40
+	jobContainer.diskUsageBytes.Store(1 << 40)
 
 	job := postgresJob()
 	job.MaxContainerDiskMb = 0
@@ -225,6 +250,27 @@ func Test_ExecuteJob_WhenRestoreFailsWithOnlyMissingExtensions_ReportsCompleted(
 		"the real non-zero exit code is preserved on the success report")
 	require.NotNil(t, report.DBSizeBytesAfterRestore)
 	assert.Equal(t, int64(9_000_000), *report.DBSizeBytesAfterRestore)
+}
+
+func Test_ExecuteJob_WhenRestoreFailsWithOnlyPreexistingPublicSchema_ReportsCompleted(t *testing.T) {
+	apiClient := &fakeAPI{downloadBody: []byte("ARCHIVE")}
+	stderr := "pg_restore: error: could not execute query: ERROR:  schema \"public\" already exists\n" +
+		"Command was: CREATE SCHEMA public;\n" +
+		"pg_restore: warning: errors ignored on restore: 1\n"
+	restorer := &fakeRestorer{
+		runErr:    fmt.Errorf("restore: %w", restore.ErrRestoreFailed),
+		runResult: restore.Result{PgRestoreExitCode: 1, DurationMs: 10, StderrTail: stderr},
+	}
+	stats := &fakeStats{stats: verifier.Stats{DBSizeBytes: 9_000_000, TableCount: 3}}
+	r := newTestRunner(apiClient, okSpawner(), restorer, stats, newFakeRegistrar())
+	r.connAlive = func(context.Context, dbconn.Conn) bool { return true }
+
+	r.executeJob(t.Context(), postgresJob())
+
+	report, ok := apiClient.lastReport()
+	require.True(t, ok)
+	assert.Equal(t, api.VerificationStatusCompleted, report.Status,
+		"an archive dumped with -n public collides with the target's own public schema; the data restored")
 }
 
 func Test_ExecuteJob_WhenRestoreExecInfraFails_ReportsFailedWithoutExitCode(t *testing.T) {
@@ -316,10 +362,12 @@ func Test_ExecuteJob_WhenTimescaleJobSucceeds_RunsPreRestoreThenRestoreThenPostR
 	report, ok := apiClient.lastReport()
 	require.True(t, ok)
 	assert.Equal(t, api.VerificationStatusCompleted, report.Status)
-	assert.Equal(t, []string{"pre", "restore", "post"}, restorer.calls,
+	assert.Equal(t, []string{"roles", "pre", "restore", "post"}, restorer.calls,
 		"timescaledb restore must enter restoring mode, restore, then leave it")
 	assert.Equal(t, 1, restorer.runParallelJobs,
 		"timescaledb restore must be single-threaded to keep _timescaledb_catalog FK order")
+	assert.True(t, restorer.runIsTimescaledb,
+		"the restorer decides on --clean from this flag")
 }
 
 func Test_ExecuteJob_WhenNonTimescaleJob_DoesNotRunTimescaleHooks(t *testing.T) {
@@ -331,10 +379,27 @@ func Test_ExecuteJob_WhenNonTimescaleJob_DoesNotRunTimescaleHooks(t *testing.T) 
 
 	r.executeJob(t.Context(), postgresJob())
 
-	assert.Equal(t, []string{"restore"}, restorer.calls,
+	assert.Equal(t, []string{"roles", "restore"}, restorer.calls,
 		"a non-timescaledb restore must not run the timescaledb hooks")
 	assert.Equal(t, 2, restorer.runParallelJobs,
 		"a non-timescaledb restore keeps parallel jobs (CPUPerJob)")
+	assert.False(t, restorer.runIsTimescaledb,
+		"the restorer decides on --clean from this flag")
+}
+
+func Test_ExecuteJob_WhenOwnerRoleCreationFails_ReportsFailedWithoutRestoring(t *testing.T) {
+	apiClient := &fakeAPI{downloadBody: []byte("ARCHIVE")}
+	restorer := &fakeRestorer{ensureRolesErr: errors.New("connect restore target: refused")}
+	r := newTestRunner(apiClient, okSpawner(), restorer, &fakeStats{}, newFakeRegistrar())
+
+	r.executeJob(t.Context(), postgresJob())
+
+	report, ok := apiClient.lastReport()
+	require.True(t, ok)
+	assert.Equal(t, api.VerificationStatusFailed, report.Status)
+	assert.Nil(t, report.PgRestoreExitCode,
+		"role setup is agent infrastructure, so the backup must not be blamed")
+	assert.Equal(t, []string{"roles"}, restorer.calls)
 }
 
 func Test_ExecuteJob_WhenAbortedBeforeFailedReport_DoesNotReport(t *testing.T) {

@@ -1,6 +1,8 @@
 package healthcheck_attempt
 
 import (
+	"context"
+
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/mock"
 
@@ -14,6 +16,7 @@ type MockHealthcheckAttemptSender struct {
 }
 
 func (m *MockHealthcheckAttemptSender) SendNotification(
+	_ context.Context,
 	notifier *notifiers.Notifier,
 	notification notifier_models.Notification,
 ) {
@@ -24,7 +27,8 @@ type MockDatabaseService struct {
 	mock.Mock
 }
 
-func (m *MockDatabaseService) TestDatabaseConnectionDirect(
+func (m *MockDatabaseService) TestTrustedDatabaseConnection(
+	ctx context.Context,
 	database *databases.Database,
 ) error {
 	return m.Called(database).Error(0)

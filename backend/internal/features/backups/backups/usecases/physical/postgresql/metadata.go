@@ -11,12 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	physical_dto "databasus-backend/internal/features/backups/backups/core/physical/dto"
 	physical_enums "databasus-backend/internal/features/backups/backups/core/physical/enums"
 	physical_models "databasus-backend/internal/features/backups/backups/core/physical/models"
 	postgresql_physical "databasus-backend/internal/features/databases/databases/postgresql/physical"
-	"databasus-backend/internal/features/storages"
-	util_encryption "databasus-backend/internal/util/encryption"
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -32,14 +33,14 @@ const metadataUploadTimeout = 2 * time.Minute
 // makes the sidecar atomic with the COMPLETED result.
 func uploadFullMetadata(
 	logger *slog.Logger,
-	fieldEncryptor util_encryption.FieldEncryptor,
-	storage storages.StorageFileSaver,
+	fileStore storage_files.FileStore,
+	storageID uuid.UUID,
 	sourceDB *postgresql_physical.PostgresqlPhysicalDatabase,
 	fullBackup *physical_models.PhysicalFullBackup,
 	result PhysicalBackupResult,
-) error {
+) (storage_files.WriteReceipt, error) {
 	if result.FileName == "" {
-		return errors.New("cannot upload metadata: file_name is empty")
+		return storage_files.WriteReceipt{}, errors.New("cannot upload metadata: file_name is empty")
 	}
 
 	metadata := physical_dto.PhysicalBackupMetadata{
@@ -61,7 +62,7 @@ func uploadFullMetadata(
 		CompletedAt:           result.CompletedAt,
 	}
 
-	return uploadMetadata(logger, fieldEncryptor, storage, result.FileName, metadata)
+	return uploadMetadata(logger, fileStore, storageID, result.FileName, metadata)
 }
 
 // uploadIncrMetadata writes the `<artifact>.metadata` sidecar for a completed
@@ -69,14 +70,14 @@ func uploadFullMetadata(
 // needs to walk the chain.
 func uploadIncrMetadata(
 	logger *slog.Logger,
-	fieldEncryptor util_encryption.FieldEncryptor,
-	storage storages.StorageFileSaver,
+	fileStore storage_files.FileStore,
+	storageID uuid.UUID,
 	sourceDB *postgresql_physical.PostgresqlPhysicalDatabase,
 	incrBackup *physical_models.PhysicalIncrementalBackup,
 	result PhysicalBackupResult,
-) error {
+) (storage_files.WriteReceipt, error) {
 	if result.FileName == "" {
-		return errors.New("cannot upload metadata: file_name is empty")
+		return storage_files.WriteReceipt{}, errors.New("cannot upload metadata: file_name is empty")
 	}
 
 	rootID := incrBackup.RootFullBackupID
@@ -102,7 +103,7 @@ func uploadIncrMetadata(
 		CompletedAt:               result.CompletedAt,
 	}
 
-	return uploadMetadata(logger, fieldEncryptor, storage, result.FileName, metadata)
+	return uploadMetadata(logger, fileStore, storageID, result.FileName, metadata)
 }
 
 // uploadMetadata marshals the metadata and PUTs `<artifact>.metadata`. It uses a
@@ -110,14 +111,14 @@ func uploadIncrMetadata(
 // cancelled backup context must not abort the sidecar write.
 func uploadMetadata(
 	logger *slog.Logger,
-	fieldEncryptor util_encryption.FieldEncryptor,
-	storage storages.StorageFileSaver,
+	fileStore storage_files.FileStore,
+	storageID uuid.UUID,
 	artifactFileName string,
 	metadata physical_dto.PhysicalBackupMetadata,
-) error {
+) (storage_files.WriteReceipt, error) {
 	body, err := json.Marshal(metadata)
 	if err != nil {
-		return fmt.Errorf("marshal metadata JSON: %w", err)
+		return storage_files.WriteReceipt{}, fmt.Errorf("marshal metadata JSON: %w", err)
 	}
 
 	metadataName := artifactFileName + metadataSuffix
@@ -125,11 +126,18 @@ func uploadMetadata(
 	ctx, cancel := context.WithTimeout(context.Background(), metadataUploadTimeout)
 	defer cancel()
 
-	if err := storage.SaveFile(ctx, fieldEncryptor, logger, metadataName, bytes.NewReader(body)); err != nil {
-		return fmt.Errorf("upload metadata: %w", err)
+	logger.DebugContext(ctx, "uploading backup metadata sidecar", "file_name", metadataName)
+
+	receipt, err := fileStore.WriteFile(
+		ctx,
+		storage_files.StoredFileReference{StorageID: storageID, FileName: metadataName},
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return storage_files.WriteReceipt{}, fmt.Errorf("upload metadata: %w", err)
 	}
 
-	return nil
+	return receipt, nil
 }
 
 // pgVersionFromTag converts the tools.PostgresqlVersion enum ("17", "18") into

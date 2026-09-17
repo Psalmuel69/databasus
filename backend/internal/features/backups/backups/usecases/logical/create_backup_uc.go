@@ -11,7 +11,6 @@ import (
 	usecases_logical_postgresql "databasus-backend/internal/features/backups/backups/usecases/logical/postgresql"
 	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
 	"databasus-backend/internal/features/databases"
-	"databasus-backend/internal/features/storages"
 )
 
 type CreateBackupUsecase struct {
@@ -26,9 +25,9 @@ func (uc *CreateBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	switch database.Type {
 	case databases.DatabaseTypePostgresLogical:
 		return uc.CreatePostgresqlBackupUsecase.Execute(
@@ -36,7 +35,7 @@ func (uc *CreateBackupUsecase) Execute(
 			backup,
 			backupConfig,
 			database,
-			storage,
+			fileStore,
 			backupProgressListener,
 		)
 
@@ -46,7 +45,7 @@ func (uc *CreateBackupUsecase) Execute(
 			backup,
 			backupConfig,
 			database,
-			storage,
+			fileStore,
 			backupProgressListener,
 		)
 
@@ -56,7 +55,7 @@ func (uc *CreateBackupUsecase) Execute(
 			backup,
 			backupConfig,
 			database,
-			storage,
+			fileStore,
 			backupProgressListener,
 		)
 
@@ -66,7 +65,7 @@ func (uc *CreateBackupUsecase) Execute(
 			backup,
 			backupConfig,
 			database,
-			storage,
+			fileStore,
 			backupProgressListener,
 		)
 

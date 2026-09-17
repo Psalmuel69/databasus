@@ -13,12 +13,13 @@ import (
 	physical_repositories "databasus-backend/internal/features/backups/backups/core/physical/repositories"
 	postgresql_executor "databasus-backend/internal/features/backups/backups/usecases/physical/postgresql"
 	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/logger"
 )
 
 func Test_FullOnly_ProducesArtifactAndManifest(t *testing.T) {
 	fixture := postgresql_executor.SetupPhysicalDBForBackup(t)
 
-	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(fixture.BackupID, false)
+	backuping_physical.CreateTestPhysicalBackuper(nil).MakeBackup(t.Context(), fixture.BackupID, false)
 
 	postgresql_executor.WaitForBackupStatus(t, fixture.BackupID, physical_enums.PhysicalBackupTypeFull,
 		physical_enums.PhysicalBackupStatusCompleted, nil, 3*time.Minute)
@@ -44,18 +45,28 @@ func Test_FullOnly_ProducesArtifactAndManifest(t *testing.T) {
 
 	encryptor := encryption.GetFieldEncryptor()
 
-	artifactReader, err := fixture.Storage.GetFile(encryptor, *finalRow.FileName)
+	artifactReader, err := fixture.Storage.GetFile(t.Context(), encryptor, logger.GetLogger(), *finalRow.FileName)
 	require.NoError(t, err, "artifact %q must be in storage", *finalRow.FileName)
 	require.NoError(t, artifactReader.Close())
 
-	sidecarReader, err := fixture.Storage.GetFile(encryptor, *finalRow.FileName+".metadata")
+	sidecarReader, err := fixture.Storage.GetFile(
+		t.Context(),
+		encryptor,
+		logger.GetLogger(),
+		*finalRow.FileName+".metadata",
+	)
 	require.NoError(t, err, "sidecar must be in storage")
 	require.NoError(t, sidecarReader.Close())
 
 	require.NotNil(t, finalRow.ManifestFileName, "ManifestFileName must be populated post-COMPLETED")
 	assert.Equal(t, *finalRow.FileName+".manifest", *finalRow.ManifestFileName)
 
-	manifestReader, err := fixture.Storage.GetFile(encryptor, *finalRow.ManifestFileName)
+	manifestReader, err := fixture.Storage.GetFile(
+		t.Context(),
+		encryptor,
+		logger.GetLogger(),
+		*finalRow.ManifestFileName,
+	)
 	require.NoError(t, err, "manifest sidecar must be in storage")
 	require.NoError(t, manifestReader.Close())
 }

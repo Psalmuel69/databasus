@@ -24,6 +24,7 @@ import {
 } from '../../features/workspaces';
 import { DatabaseFleetComponent } from '../../pages/database-discovery';
 import { useIsMobile, useIsNewGitHubVersionAvailable, useScreenHeight } from '../../shared/hooks';
+import { SponsorshipLinkComponent } from '../../shared/ui';
 import { StarButtonComponent } from '../../shared/ui/StarButtonComponent';
 import { ThemeToggleComponent } from '../../shared/ui/ThemeToggleComponent';
 import { SidebarComponent } from './SidebarComponent';
@@ -248,6 +249,8 @@ export const MainScreenComponent = () => {
           >
             Community
           </a>
+
+          <SponsorshipLinkComponent className="!text-black hover:opacity-80 dark:!text-gray-200" />
 
           {isUsedMoreThan85Percent && (
             <Tooltip title="To make backups locally and restore them, you need to have enough space on your disk. For restore, you need to have same amount of space that the backup size.">
