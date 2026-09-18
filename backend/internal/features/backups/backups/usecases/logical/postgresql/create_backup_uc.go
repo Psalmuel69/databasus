@@ -222,6 +222,12 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 
 	copyErr := <-copyResultCh
 	bytesWritten := <-bytesWrittenCh
+
+	// exec.Cmd.StderrPipe: Wait closes the pipe once it sees the process exit, so a Wait
+	// before the goroutine has drained it can truncate the very output callers need to
+	// diagnose a fast-failing client. Draining first is safe: the pipe reaches EOF as soon
+	// as the child's stderr fd closes, which happens on process exit independent of Wait.
+	stderrOutput := <-stderrCh
 	waitErr := cmd.Wait()
 
 	select {
@@ -247,7 +253,6 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	}
 
 	saveErr := <-fileWrite.Errors
-	stderrOutput := <-stderrCh
 
 	// Send final sizing after backup is completed
 	if waitErr == nil && copyErr == nil && saveErr == nil && backupProgressListener != nil {

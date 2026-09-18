@@ -328,9 +328,14 @@ func (uc *RestorePostgresqlBackupUsecase) restoreViaStdin(
 		}
 	}()
 
+	// exec.Cmd.StderrPipe: Wait closes the pipe once it sees the process exit, so a Wait
+	// before the goroutine has drained it can truncate the very output callers need to
+	// diagnose a fast-failing client. Draining first is safe: the pipe reaches EOF as soon
+	// as the child's stderr fd closes, which happens on process exit independent of Wait.
+	stderrOutput := <-stderrCh
+
 	// Wait for the restore to finish
 	waitErr := cmd.Wait()
-	stderrOutput := <-stderrCh
 	copyErr := <-copyErrCh
 
 	// Check for cancellation
@@ -707,9 +712,14 @@ func (uc *RestorePostgresqlBackupUsecase) executePgRestore(
 		return fmt.Errorf("start %s: %w", filepath.Base(pgBin), err)
 	}
 
+	// exec.Cmd.StderrPipe: Wait closes the pipe once it sees the process exit, so a Wait
+	// before the goroutine has drained it can truncate the very output callers need to
+	// diagnose a fast-failing client. Draining first is safe: the pipe reaches EOF as soon
+	// as the child's stderr fd closes, which happens on process exit independent of Wait.
+	stderrOutput := <-stderrCh
+
 	// Wait for the restore to finish
 	waitErr := cmd.Wait()
-	stderrOutput := <-stderrCh
 
 	// Check for cancellation
 	select {
