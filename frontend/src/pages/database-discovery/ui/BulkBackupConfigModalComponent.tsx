@@ -114,7 +114,11 @@ export const BulkBackupConfigModalComponent = ({
       : DatabaseType.POSTGRES_LOGICAL
     : ENGINE_TO_LOGICAL_DATABASE_TYPE[instanceType];
 
-  const placeholderDatabase = buildPlaceholderDatabase(workspaceId, databaseType, physicalBackupType);
+  const placeholderDatabase = buildPlaceholderDatabase(
+    workspaceId,
+    databaseType,
+    physicalBackupType,
+  );
 
   const finalizeBulkConfig = async (notifiers: Notifier[]) => {
     setIsSaving(true);
@@ -201,7 +205,10 @@ export const BulkBackupConfigModalComponent = ({
                     <Radio key={option.value} value={option.value}>
                       {option.label}
                       <Tooltip title={option.description}>
-                        <InfoCircleOutlined className="ml-1 cursor-pointer" style={{ color: 'gray' }} />
+                        <InfoCircleOutlined
+                          className="ml-1 cursor-pointer"
+                          style={{ color: 'gray' }}
+                        />
                       </Tooltip>
                     </Radio>
                   ))}
@@ -270,7 +277,9 @@ export const BulkBackupConfigModalComponent = ({
           onCancel={onClose}
           isShowSaveOnlyForUnsaved={false}
           saveButtonText={
-            isSaving ? 'Applying...' : `Save & apply to ${selectedCount} database${selectedCount === 1 ? '' : 's'}`
+            isSaving
+              ? 'Applying...'
+              : `Save & apply to ${selectedCount} database${selectedCount === 1 ? '' : 's'}`
           }
           isSaveToApi={false}
           onSaved={(database) => finalizeBulkConfig(database.notifiers)}
