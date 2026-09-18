@@ -55,7 +55,7 @@ func (c *DatabaseInstanceController) RegisterInstance(ctx *gin.Context) {
 		return
 	}
 
-	instance, err := c.instanceService.RegisterInstance(user, request.WorkspaceID, &request)
+	instance, err := c.instanceService.RegisterInstance(ctx.Request.Context(), user, request.WorkspaceID, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -95,7 +95,7 @@ func (c *DatabaseInstanceController) UpdateInstance(ctx *gin.Context) {
 		return
 	}
 
-	instance, err := c.instanceService.UpdateInstance(user, &request)
+	instance, err := c.instanceService.UpdateInstance(ctx.Request.Context(), user, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -129,7 +129,7 @@ func (c *DatabaseInstanceController) GetInstances(ctx *gin.Context) {
 		return
 	}
 
-	instances, err := c.instanceService.GetInstancesByWorkspace(user, workspaceID)
+	instances, err := c.instanceService.GetInstancesByWorkspace(ctx.Request.Context(), user, workspaceID)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -161,7 +161,7 @@ func (c *DatabaseInstanceController) GetInstance(ctx *gin.Context) {
 		return
 	}
 
-	instance, err := c.instanceService.GetInstance(user, id)
+	instance, err := c.instanceService.GetInstance(ctx.Request.Context(), user, id)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -192,7 +192,7 @@ func (c *DatabaseInstanceController) DeleteInstance(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.instanceService.DeleteInstance(user, id); err != nil {
+	if err := c.instanceService.DeleteInstance(ctx.Request.Context(), user, id); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -223,7 +223,7 @@ func (c *DatabaseInstanceController) DiscoverDatabases(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.instanceService.DiscoverDatabases(user, id)
+	response, err := c.instanceService.DiscoverDatabases(ctx.Request.Context(), user, id)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -266,7 +266,7 @@ func (c *DatabaseInstanceController) BulkConfigureBackups(ctx *gin.Context) {
 		return
 	}
 
-	response, err := c.instanceService.BulkConfigureBackups(user, &request)
+	response, err := c.instanceService.BulkConfigureBackups(ctx.Request.Context(), user, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

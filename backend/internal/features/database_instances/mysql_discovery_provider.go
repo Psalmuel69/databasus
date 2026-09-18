@@ -29,7 +29,7 @@ func (p *MysqlDiscoveryProvider) DiscoverDatabases(
 	if err != nil {
 		return nil, fmt.Errorf("failed to open connection to %s instance: %w", instance.Type, err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT
@@ -44,7 +44,7 @@ func (p *MysqlDiscoveryProvider) DiscoverDatabases(
 	if err != nil {
 		return nil, fmt.Errorf("failed to query information_schema: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var databases []DiscoveredDatabase
 

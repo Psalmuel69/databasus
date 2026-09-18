@@ -1,6 +1,7 @@
 package database_instances
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -17,10 +18,11 @@ type configuredDatabaseInfo struct {
 // (matching engine family, host, and port). One workspace-wide query with
 // preloads - no per-name lookups.
 func (s *DatabaseInstanceService) findConfiguredDatabases(
+	ctx context.Context,
 	user *users_models.User,
 	instance *DatabaseInstance,
 ) (map[string]configuredDatabaseInfo, error) {
-	existing, err := s.databaseService.GetDatabasesByWorkspace(user, instance.WorkspaceID)
+	existing, err := s.databaseService.GetDatabasesByWorkspace(ctx, user, instance.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
