@@ -21,7 +21,7 @@ import (
 	"databasus-backend/internal/features/databases"
 	mongodbtypes "databasus-backend/internal/features/databases/databases/mongodb"
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
-	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/namelist"
 	"databasus-backend/internal/util/tools"
@@ -55,39 +55,46 @@ func (uc *CreateMongodbBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	db *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info(
-		"Creating MongoDB backup via mongodump",
-		"databaseId", db.ID,
-		"storageId", storage.ID,
-	)
+) (*backups_core_logical.BackupArtifacts, error) {
+	logger := uc.logger.With("database_id", db.ID, "storage_id", backup.StorageID)
 
-	mdb := db.Mongodb
-	if mdb == nil {
+	logger.InfoContext(ctx, "creating mongodb backup via mongodump")
+
+	tunneledDatabase, err := databases.OpenTunnel(ctx, databases.OpenTunnelSpec{
+		Database:  db,
+		Logger:    logger,
+		Encryptor: uc.fieldEncryptor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	mongodbDatabase := tunneledDatabase.GetDatabaseThroughTunnel().Mongodb
+	if mongodbDatabase == nil {
 		return nil, fmt.Errorf("mongodb database configuration is required")
 	}
 
-	if mdb.Database == "" {
+	if mongodbDatabase.Database == "" {
 		return nil, fmt.Errorf("database name is required for mongodump backups")
 	}
 
-	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mdb.Password)
+	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mongodbDatabase.Password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt database password: %w", err)
 	}
 
-	rawSizeMB, err := mdb.GetRawDbSizeMb(ctx, uc.logger, uc.fieldEncryptor)
+	rawSizeMB, err := mongodbDatabase.GetRawDbSizeMb(ctx, logger, uc.fieldEncryptor)
 	if err != nil {
-		uc.logger.Warn("failed to fetch raw db size before backup",
-			"database_id", db.ID,
-			"error", err)
+		logger.WarnContext(ctx, "failed to fetch raw db size before backup", "error", err)
 	} else {
 		backup.BackupRawDbSizeMb = rawSizeMB
 	}
 
-	args := uc.buildMongodumpArgs(mdb, decryptedPassword)
+	args := uc.buildMongodumpArgs(mongodbDatabase, decryptedPassword)
 
 	return uc.streamToStorage(
 		ctx,
@@ -95,7 +102,7 @@ func (uc *CreateMongodbBackupUsecase) Execute(
 		backupConfig,
 		tools.GetMongodbExecutable(tools.MongodbExecutableMongodump),
 		args,
-		storage,
+		fileStore,
 		backupProgressListener,
 	)
 }
@@ -132,10 +139,10 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	mongodumpBin string,
 	args []string,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info("Streaming MongoDB backup to storage", "mongodumpBin", mongodumpBin)
+) (*backups_core_logical.BackupArtifacts, error) {
+	uc.logger.InfoContext(parentCtx, "streaming MongoDB backup to storage", "mongodump_bin", mongodumpBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
 	defer cancel(nil)
@@ -150,7 +157,7 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 			safeArgs[i] = arg
 		}
 	}
-	uc.logger.Info("Executing MongoDB backup command", "command", mongodumpBin, "args", safeArgs)
+	uc.logger.InfoContext(parentCtx, "executing MongoDB backup command", "command", mongodumpBin, "args", safeArgs)
 
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
@@ -185,23 +192,17 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	saveErrCh := make(chan error, 1)
-	go func() {
-		saveErr := storage.SaveFile(
-			ctx,
-			uc.fieldEncryptor,
-			uc.logger,
-			backup.FileName,
-			storageReader,
-		)
-		if saveErr != nil {
-			_ = storageReader.CloseWithError(saveErr)
-			cancel(saveErr)
-		}
-		saveErrCh <- saveErr
-	}()
+	fileWrite := storage_files.StartBackgroundWrite(
+		ctx,
+		fileStore,
+		storage_files.StoredFileReference{StorageID: backup.StorageID, FileName: backup.FileName},
+		storageReader,
+		cancel,
+	)
 
 	if err = cmd.Start(); err != nil {
+		uc.cleanupOnCancellation(encryptionWriter, storageWriter, fileWrite.Errors)
+
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(mongodumpBin), err)
 	}
 
@@ -220,32 +221,37 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 
 	copyErr := <-copyResultCh
 	bytesWritten := <-bytesWrittenCh
+
+	// exec.Cmd.StderrPipe: Wait closes the pipe once it sees the process exit, so a Wait
+	// before the goroutine has drained it can truncate the very output callers need to
+	// diagnose a fast-failing client. Draining first is safe: the pipe reaches EOF as soon
+	// as the child's stderr fd closes, which happens on process exit independent of Wait.
+	stderrOutput := <-stderrCh
 	waitErr := cmd.Wait()
 
 	select {
-	case earlySaveErr := <-saveErrCh:
+	case earlySaveErr := <-fileWrite.Errors:
 		if earlySaveErr != nil {
 			_ = uc.closeWriters(encryptionWriter, storageWriter)
 			return nil, fmt.Errorf("save to storage: %w", earlySaveErr)
 		}
-		saveErrCh <- nil
+		fileWrite.Errors <- nil
 	default:
 	}
 
 	select {
 	case <-ctx.Done():
-		uc.cleanupOnCancellation(encryptionWriter, storageWriter, saveErrCh)
+		uc.cleanupOnCancellation(encryptionWriter, storageWriter, fileWrite.Errors)
 		return nil, uc.classifyCancellation(ctx)
 	default:
 	}
 
 	if err := uc.closeWriters(encryptionWriter, storageWriter); err != nil {
-		<-saveErrCh
+		<-fileWrite.Errors
 		return nil, err
 	}
 
-	saveErr := <-saveErrCh
-	stderrOutput := <-stderrCh
+	saveErr := <-fileWrite.Errors
 
 	if waitErr == nil && copyErr == nil && saveErr == nil && backupProgressListener != nil {
 		sizeMB := float64(bytesWritten) / (1024 * 1024)
@@ -261,7 +267,10 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 		return nil, fmt.Errorf("save to storage: %w", saveErr)
 	}
 
-	return &backupMetadata, nil
+	return &backups_core_logical.BackupArtifacts{
+		Metadata: &backupMetadata,
+		Receipts: []storage_files.WriteReceipt{<-fileWrite.Receipts},
+	}, nil
 }
 
 func (uc *CreateMongodbBackupUsecase) createBackupContext(
@@ -398,13 +407,13 @@ func (uc *CreateMongodbBackupUsecase) copyWithShutdownCheck(
 func (uc *CreateMongodbBackupUsecase) cleanupOnCancellation(
 	encryptionWriter *backup_encryption.EncryptionWriter,
 	storageWriter *io.PipeWriter,
-	saveErrCh chan error,
+	writeErrors chan error,
 ) {
 	if encryptionWriter != nil {
 		_ = encryptionWriter.Close()
 	}
 	_ = storageWriter.CloseWithError(errors.New("backup cancelled"))
-	<-saveErrCh
+	<-writeErrors
 }
 
 func (uc *CreateMongodbBackupUsecase) closeWriters(
@@ -413,12 +422,12 @@ func (uc *CreateMongodbBackupUsecase) closeWriters(
 ) error {
 	if encryptionWriter != nil {
 		if err := encryptionWriter.Close(); err != nil {
-			uc.logger.Error("Failed to close encryption writer", "error", err)
+			uc.logger.Error("failed to close encryption writer", "error", err)
 			return fmt.Errorf("failed to close encryption writer: %w", err)
 		}
 	}
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close storage writer", "error", err)
+		uc.logger.Error("failed to close storage writer", "error", err)
 		return fmt.Errorf("failed to close storage writer: %w", err)
 	}
 	return nil

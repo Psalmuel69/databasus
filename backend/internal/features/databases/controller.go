@@ -30,7 +30,7 @@ func (c *DatabaseController) RegisterRoutes(router *gin.RouterGroup) {
 	router.POST("/databases/:id/copy", c.CopyDatabase)
 	router.GET("/databases/notifier/:id/is-using", c.IsNotifierUsing)
 	router.GET("/databases/notifier/:id/databases-count", c.CountDatabasesByNotifier)
-	router.POST("/databases/is-readonly", c.IsUserReadOnly)
+	router.POST("/databases/should-suggest-readonly-user", c.ShouldSuggestReadOnlyUser)
 	router.POST("/databases/create-readonly-user", c.CreateReadOnlyUser)
 	router.POST("/databases/create-replication-only-user", c.CreateReplicationOnlyUser)
 }
@@ -68,7 +68,7 @@ func (c *DatabaseController) CreateDatabase(ctx *gin.Context) {
 		return
 	}
 
-	database, err := c.databaseService.CreateDatabase(user, *request.WorkspaceID, &request)
+	database, err := c.databaseService.CreateDatabase(ctx.Request.Context(), user, *request.WorkspaceID, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -102,7 +102,7 @@ func (c *DatabaseController) UpdateDatabase(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.databaseService.UpdateDatabase(user, &request); err != nil {
+	if err := c.databaseService.UpdateDatabase(ctx.Request.Context(), user, &request); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -133,7 +133,8 @@ func (c *DatabaseController) DeleteDatabase(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.databaseService.DeleteDatabase(user, id); err != nil {
+	if err := c.databaseService.DeleteDatabase(ctx.Request.Context(), user, id); err != nil {
+		_ = ctx.Error(err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -164,7 +165,7 @@ func (c *DatabaseController) GetDatabase(ctx *gin.Context) {
 		return
 	}
 
-	database, err := c.databaseService.GetDatabase(user, id)
+	database, err := c.databaseService.GetDatabase(ctx.Request.Context(), user, id)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -203,7 +204,7 @@ func (c *DatabaseController) GetDatabases(ctx *gin.Context) {
 		return
 	}
 
-	databases, err := c.databaseService.GetDatabasesByWorkspace(user, workspaceID)
+	databases, err := c.databaseService.GetDatabasesByWorkspace(ctx.Request.Context(), user, workspaceID)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -214,11 +215,12 @@ func (c *DatabaseController) GetDatabases(ctx *gin.Context) {
 
 // TestDatabaseConnection
 // @Summary Test database connection
-// @Description Test connection to an existing database configuration
+// @Description Test connection to an existing database configuration. A physical PostgreSQL source is refused with a machine-readable code, including no_wal_switch_privilege when the backup type is FULL_INCREMENTAL_WAL_STREAM and the credentials cannot execute pg_switch_wal().
 // @Tags databases
+// @Produce json
 // @Param id path string true "Database ID"
 // @Success 200
-// @Failure 400
+// @Failure 400 {object} map[string]string
 // @Failure 401
 // @Failure 500
 // @Router /databases/{id}/test-connection [post]
@@ -235,7 +237,7 @@ func (c *DatabaseController) TestDatabaseConnection(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.databaseService.TestDatabaseConnection(user, id); err != nil {
+	if err := c.databaseService.TestDatabaseConnection(ctx.Request.Context(), user, id); err != nil {
 		respondConnectionTestError(ctx, err)
 		return
 	}
@@ -245,16 +247,19 @@ func (c *DatabaseController) TestDatabaseConnection(ctx *gin.Context) {
 
 // TestDatabaseConnectionDirect
 // @Summary Test database connection directly
-// @Description Test connection to a database configuration without saving it
+// @Description Test connection to a database configuration without saving it. A physical PostgreSQL source is refused with a machine-readable code, including no_wal_switch_privilege when the backup type is FULL_INCREMENTAL_WAL_STREAM and the credentials cannot execute pg_switch_wal().
 // @Tags databases
 // @Accept json
+// @Produce json
 // @Param request body Database true "Database configuration to test"
 // @Success 200
-// @Failure 400
+// @Failure 400 {object} map[string]string
 // @Failure 401
+// @Failure 403 {object} map[string]string
+// @Failure 500 {object} map[string]string
 // @Router /databases/test-connection-direct [post]
 func (c *DatabaseController) TestDatabaseConnectionDirect(ctx *gin.Context) {
-	_, ok := users_middleware.GetUserFromContext(ctx)
+	user, ok := users_middleware.GetUserFromContext(ctx)
 	if !ok {
 		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
 		return
@@ -266,7 +271,7 @@ func (c *DatabaseController) TestDatabaseConnectionDirect(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.databaseService.TestDatabaseConnectionDirect(&request); err != nil {
+	if err := c.databaseService.TestDatabaseConnectionDirect(ctx.Request.Context(), user, &request); err != nil {
 		respondConnectionTestError(ctx, err)
 		return
 	}
@@ -274,9 +279,22 @@ func (c *DatabaseController) TestDatabaseConnectionDirect(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"message": "connection successful"})
 }
 
-// respondConnectionTestError writes a 400 carrying the machine-readable code for a classified
-// connection failure (physical PostgreSQL), or a plain error message for any other failure.
 func respondConnectionTestError(ctx *gin.Context, err error) {
+	if errors.Is(err, ErrInsufficientPermissionsToTestDatabaseConnection) {
+		ctx.JSON(http.StatusForbidden, gin.H{"error": ErrInsufficientPermissionsToTestDatabaseConnection.Error()})
+		return
+	}
+
+	if errors.Is(err, ErrDatabaseConnectionTargetLookup) {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": ErrDatabaseConnectionTargetLookup.Error()})
+		return
+	}
+
+	if errors.Is(err, ErrDatabaseConnectionAuthorizationLookup) {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": ErrDatabaseConnectionAuthorizationLookup.Error()})
+		return
+	}
+
 	if connErr, ok := errors.AsType[*postgresql_shared.ConnectionTestError](err); ok {
 		ctx.JSON(http.StatusBadRequest, gin.H{"code": connErr.Code})
 		return
@@ -309,8 +327,9 @@ func (c *DatabaseController) IsNotifierUsing(ctx *gin.Context) {
 		return
 	}
 
-	isUsing, err := c.databaseService.IsNotifierUsing(user, id)
+	isUsing, err := c.databaseService.IsNotifierUsing(ctx.Request.Context(), user, id)
 	if err != nil {
+		_ = ctx.Error(err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -342,8 +361,9 @@ func (c *DatabaseController) CountDatabasesByNotifier(ctx *gin.Context) {
 		return
 	}
 
-	count, err := c.databaseService.CountDatabasesByNotifier(user, id)
+	count, err := c.databaseService.CountDatabasesByNotifier(ctx.Request.Context(), user, id)
 	if err != nil {
+		_ = ctx.Error(err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -375,7 +395,7 @@ func (c *DatabaseController) CopyDatabase(ctx *gin.Context) {
 		return
 	}
 
-	copiedDatabase, err := c.databaseService.CopyDatabase(user, id)
+	copiedDatabase, err := c.databaseService.CopyDatabase(ctx.Request.Context(), user, id)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -384,20 +404,20 @@ func (c *DatabaseController) CopyDatabase(ctx *gin.Context) {
 	ctx.JSON(http.StatusCreated, copiedDatabase)
 }
 
-// IsUserReadOnly
-// @Summary Check if database user is read-only
-// @Description Check if current database credentials have only read (SELECT) privileges
+// ShouldSuggestReadOnlyUser
+// @Summary Check whether a limited backup user should be suggested
+// @Description Report whether Databasus should offer to create a read-only (or replication-only) user for these credentials
 // @Tags databases
 // @Accept json
 // @Produce json
 // @Security BearerAuth
 // @Param request body Database true "Database configuration to check"
-// @Success 200 {object} IsReadOnlyResponse
+// @Success 200 {object} ShouldSuggestReadOnlyUserResponse
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 403 {object} map[string]string
-// @Router /databases/is-readonly [post]
-func (c *DatabaseController) IsUserReadOnly(ctx *gin.Context) {
+// @Router /databases/should-suggest-readonly-user [post]
+func (c *DatabaseController) ShouldSuggestReadOnlyUser(ctx *gin.Context) {
 	user, ok := users_middleware.GetUserFromContext(ctx)
 	if !ok {
 		ctx.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
@@ -410,13 +430,20 @@ func (c *DatabaseController) IsUserReadOnly(ctx *gin.Context) {
 		return
 	}
 
-	isReadOnly, privileges, err := c.databaseService.IsUserReadOnly(user, &request)
+	shouldSuggestReadOnlyUser, privileges, err := c.databaseService.ShouldSuggestReadOnlyUser(
+		ctx.Request.Context(),
+		user,
+		&request,
+	)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	ctx.JSON(http.StatusOK, IsReadOnlyResponse{IsReadOnly: isReadOnly, Privileges: privileges})
+	ctx.JSON(http.StatusOK, ShouldSuggestReadOnlyUserResponse{
+		ShouldSuggestReadOnlyUser: shouldSuggestReadOnlyUser,
+		Privileges:                privileges,
+	})
 }
 
 // CreateReadOnlyUser
@@ -445,7 +472,7 @@ func (c *DatabaseController) CreateReadOnlyUser(ctx *gin.Context) {
 		return
 	}
 
-	username, password, err := c.databaseService.CreateReadOnlyUser(user, &request)
+	username, password, err := c.databaseService.CreateReadOnlyUser(ctx.Request.Context(), user, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -459,13 +486,13 @@ func (c *DatabaseController) CreateReadOnlyUser(ctx *gin.Context) {
 
 // CreateReplicationOnlyUser
 // @Summary Create replication-only database user (PostgreSQL physical only)
-// @Description Provision a fresh PostgreSQL role with LOGIN + REPLICATION (or its cloud equivalent on RDS / Azure / GCP) and nothing more. Refuses for database types other than POSTGRES_PHYSICAL.
+// @Description Provision a fresh PostgreSQL role with LOGIN + REPLICATION (or its cloud equivalent on RDS / Azure / GCP) plus EXECUTE on pg_switch_wal() where the source allows it, and nothing more. isForcedWalRotationAvailable reports whether the created role can force a WAL segment switch, which the FULL_INCREMENTAL_WAL_STREAM backup type requires. Refuses for database types other than POSTGRES_PHYSICAL.
 // @Tags databases
 // @Accept json
 // @Produce json
 // @Security BearerAuth
 // @Param request body Database true "Database configuration (must be POSTGRES_PHYSICAL)"
-// @Success 200 {object} CreateReadOnlyUserResponse
+// @Success 200 {object} CreateReplicationOnlyUserResponse
 // @Failure 400 {object} map[string]string
 // @Failure 401 {object} map[string]string
 // @Failure 403 {object} map[string]string
@@ -483,14 +510,15 @@ func (c *DatabaseController) CreateReplicationOnlyUser(ctx *gin.Context) {
 		return
 	}
 
-	username, password, err := c.databaseService.CreateReplicationOnlyUser(user, &request)
+	createdUser, err := c.databaseService.CreateReplicationOnlyUser(ctx.Request.Context(), user, &request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	ctx.JSON(http.StatusOK, CreateReadOnlyUserResponse{
-		Username: username,
-		Password: password,
+	ctx.JSON(http.StatusOK, CreateReplicationOnlyUserResponse{
+		Username:                     createdUser.Username,
+		Password:                     createdUser.Password,
+		IsForcedWalRotationAvailable: createdUser.IsForcedWalRotationAvailable,
 	})
 }

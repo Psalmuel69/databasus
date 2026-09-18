@@ -27,10 +27,8 @@ const (
 )
 
 const (
-	// defaultTestParallelWorkers is the number of parallel test workers, used
-	// when TEST_PARALLEL_WORKERS is unset. Each worker gets its own metadata DB
-	// and Valkey logical DB, so this must stay <= 16 (Valkey's default logical DB
-	// count) and equal to the `go test -p` value.
+	// defaultTestParallelWorkers must equal the `go test -p` value so every running package can
+	// claim an isolated metadata database.
 	defaultTestParallelWorkers = 8
 
 	// testSlotAdvisoryLockBase is the first pg_advisory_lock key reserved for
@@ -51,22 +49,7 @@ type EnvVariables struct {
 	DatabaseDsn         string `env:"DATABASE_DSN"          required:"true"`
 	TestDatabaseDsn     string `env:"TEST_DATABASE_DSN"`
 	TestParallelWorkers int    `env:"TEST_PARALLEL_WORKERS"`
-	// Internal Valkey
-	ValkeyHost     string `env:"VALKEY_HOST"     required:"true"`
-	ValkeyPort     string `env:"VALKEY_PORT"     required:"true"`
-	ValkeyUsername string `env:"VALKEY_USERNAME"`
-	ValkeyPassword string `env:"VALKEY_PASSWORD"`
-	ValkeyIsSsl    bool   `env:"VALKEY_IS_SSL"   required:"true"`
-
-	// Per-worker test isolation (computed, only set under `go test`): each test
-	// binary claims a slot 0..TestParallelWorkers-1 that selects its own metadata DB
-	// (DatabaseDsn is rewritten to dbname=<base>_w{slot}), its own Valkey logical
-	// DB (ValkeySelectDB), and a cache-key namespace ("w{slot}:"). All zero/empty in
-	// production.
-	ValkeySelectDB int
-	CacheNamespace string
-
-	TestLocalhost string `env:"TEST_LOCALHOST"`
+	TestLocalhost       string `env:"TEST_LOCALHOST"`
 
 	ShowDbInstallationVerificationLogs bool `env:"SHOW_DB_INSTALLATION_VERIFICATION_LOGS"`
 
@@ -142,12 +125,12 @@ func loadEnvVariables() {
 
 	envPath := filepath.Join(filepath.Dir(backendRoot), ".env")
 
-	log.Info("Trying to load .env", "path", envPath)
+	log.Info("trying to load .env", "path", envPath)
 	if err := godotenv.Load(envPath); err != nil {
-		log.Error("Error loading .env file from repo root", "path", envPath, "error", err)
-		os.Exit(1)
+		log.Error("error loading .env file from repo root", "path", envPath, "error", err)
+		logger.ExitAfterFlush(1)
 	}
-	log.Info("Successfully loaded .env", "path", envPath)
+	log.Info("successfully loaded .env", "path", envPath)
 
 	// Empty values for non-string fields (e.g. SMTP_PORT=) crash cleanenv's
 	// strconv parsing. Drop them so cleanenv falls back to the Go zero value.
@@ -155,13 +138,13 @@ func loadEnvVariables() {
 
 	err = cleanenv.ReadEnv(&env)
 	if err != nil {
-		log.Error("Configuration could not be loaded", "error", err)
-		os.Exit(1)
+		log.Error("configuration could not be loaded", "error", err)
+		logger.ExitAfterFlush(1)
 	}
 
 	if env.SMTPHost != "" && env.SMTPPort <= 0 {
 		log.Error("SMTP_PORT must be a positive integer when SMTP_HOST is set", "value", env.SMTPPort)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	// Set default value for ShowDbInstallationVerificationLogs if not defined
@@ -169,17 +152,12 @@ func loadEnvVariables() {
 		env.ShowDbInstallationVerificationLogs = true
 	}
 
-	for _, arg := range os.Args {
-		if strings.Contains(arg, "test") {
-			env.IsTesting = true
-			break
-		}
-	}
+	env.IsTesting = isTestProcess(os.Args)
 
 	if env.IsTesting {
 		if env.TestDatabaseDsn == "" {
 			log.Error("TEST_DATABASE_DSN is empty")
-			os.Exit(1)
+			logger.ExitAfterFlush(1)
 		}
 
 		env.DatabaseDsn = env.TestDatabaseDsn
@@ -190,24 +168,24 @@ func loadEnvVariables() {
 
 		// Only a real `go test` binary claims a per-worker slot; the cleanup_test_db
 		// command and any other tool run with IsTesting=true must operate on all
-		// slots, so they keep the base test DSN and default Valkey DB.
+		// slots, so they keep the base test DSN.
 		if strings.Contains(os.Args[0], ".test") {
-			applyTestWorkerSlot()
+			claimTestWorkerSlotAndSelectMetadataDatabase()
 		}
 	}
 
 	if env.DatabaseDsn == "" {
 		log.Error("DATABASE_DSN is empty")
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	if env.EnvMode == "" {
 		log.Error("ENV_MODE is empty")
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 	if env.EnvMode != "development" && env.EnvMode != "production" {
 		log.Error("ENV_MODE is invalid", "mode", env.EnvMode)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 	log.Info("ENV_MODE loaded", "mode", env.EnvMode)
 
@@ -215,16 +193,6 @@ func loadEnvVariables() {
 
 	if env.TestLocalhost == "" {
 		env.TestLocalhost = "localhost"
-	}
-
-	// Valkey
-	if env.ValkeyHost == "" {
-		log.Error("VALKEY_HOST is empty")
-		os.Exit(1)
-	}
-	if env.ValkeyPort == "" {
-		log.Error("VALKEY_PORT is empty")
-		os.Exit(1)
 	}
 
 	// Store the data and temp folders one level below the root
@@ -239,19 +207,19 @@ func loadEnvVariables() {
 	if env.IsTesting {
 		if env.TestLogicalPostgres16Port == "" {
 			log.Error("TEST_LOGICAL_POSTGRES_16_PORT is empty")
-			os.Exit(1)
+			logger.ExitAfterFlush(1)
 		}
 		if env.TestPhysicalPostgres17Port == "" {
 			log.Error("TEST_PHYSICAL_POSTGRES_17_PORT is empty")
-			os.Exit(1)
+			logger.ExitAfterFlush(1)
 		}
 		if env.TestPhysicalPostgres18Port == "" {
 			log.Error("TEST_PHYSICAL_POSTGRES_18_PORT is empty")
-			os.Exit(1)
+			logger.ExitAfterFlush(1)
 		}
 	}
 
-	log.Info("Environment variables loaded successfully!")
+	log.Info("environment variables loaded successfully")
 }
 
 func unsetEmptyEnvVars() {
@@ -267,6 +235,18 @@ func unsetEmptyEnvVars() {
 	}
 }
 
+func isTestProcess(arguments []string) bool {
+	if len(arguments) == 0 {
+		return false
+	}
+
+	executableName := filepath.Base(arguments[0])
+	return strings.HasSuffix(executableName, ".test") ||
+		strings.HasSuffix(executableName, ".test.exe") ||
+		executableName == "cleanup_test_db" ||
+		executableName == "cleanup_test_db.exe"
+}
+
 // slotLockConn holds the system-DB connection whose session owns this worker's
 // advisory lock. It must live for the whole process: closing it (or letting it
 // be garbage-collected) releases the lock and frees the slot for another worker
@@ -276,14 +256,11 @@ func unsetEmptyEnvVars() {
 //nolint:unused // assigned-only: keeps the advisory-lock connection alive for the process lifetime
 var slotLockConn *sql.Conn
 
-// applyTestWorkerSlot claims a free slot for this test binary and rewrites the
-// env so the worker runs fully isolated: its own metadata DB, Valkey logical DB,
-// and registry namespace.
-func applyTestWorkerSlot() {
+func claimTestWorkerSlotAndSelectMetadataDatabase() {
 	baseDbName, _, err := RewriteDbName(env.TestDatabaseDsn, systemDbName)
 	if err != nil {
 		log.Error("could not parse TEST_DATABASE_DSN for slot isolation", "error", err)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	slot := claimTestWorkerSlot(env.TestDatabaseDsn, env.TestParallelWorkers)
@@ -292,12 +269,10 @@ func applyTestWorkerSlot() {
 	_, slotDsn, err := RewriteDbName(env.TestDatabaseDsn, slotDbName)
 	if err != nil {
 		log.Error("could not build per-slot DSN", "error", err)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	env.DatabaseDsn = slotDsn
-	env.ValkeySelectDB = slot
-	env.CacheNamespace = fmt.Sprintf("w%d:", slot)
 
 	log.Info("claimed test worker slot", "slot", slot, "db", slotDbName)
 }
@@ -314,20 +289,20 @@ func claimTestWorkerSlot(testDsn string, pool int) int {
 	_, systemDsn, err := RewriteDbName(testDsn, systemDbName)
 	if err != nil {
 		log.Error("could not build system DSN for slot claim", "error", err)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	db, err := sql.Open("pgx", systemDsn)
 	if err != nil {
 		log.Error("could not open system DB for slot claim", "error", err)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		log.Error("could not get system DB connection for slot claim", "error", err)
-		os.Exit(1)
+		logger.ExitAfterFlush(1)
 	}
 
 	deadline := time.Now().Add(testSlotClaimTimeout)
@@ -341,7 +316,7 @@ func claimTestWorkerSlot(testDsn string, pool int) int {
 			).Scan(&locked)
 			if lockErr != nil {
 				log.Error("advisory lock query failed during slot claim", "error", lockErr)
-				os.Exit(1)
+				logger.ExitAfterFlush(1)
 			}
 
 			if locked {
@@ -356,7 +331,7 @@ func claimTestWorkerSlot(testDsn string, pool int) int {
 				"pool", pool,
 				"hint", "TEST_PARALLEL_WORKERS must be >= the `go test -p` value",
 			)
-			os.Exit(1)
+			logger.ExitAfterFlush(1)
 		}
 
 		time.Sleep(100 * time.Millisecond)

@@ -3,6 +3,11 @@ package backuping_physical
 import "time"
 
 const (
+	// Bounds only the first dial and handshake through the bastion — the forwarder then lives until
+	// Close, which for a WAL streamer is weeks. Generous because a backup that cannot start is worse
+	// than one that starts slowly, and because the alternative to waiting is a missed cadence.
+	bastionOpenTimeout = 30 * time.Second
+
 	// Scheduler tick and recovery sweep share this cadence. Each tick is a handful
 	// of cheap indexed queries per enabled DB, so a 1 s cadence keeps out-of-cadence
 	// backup triggers and crash recovery near-immediate without meaningful load
@@ -72,3 +77,12 @@ const minWalDeleteBudgetMB float64 = 256
 // Conservative fallback floor in cleaner grace logic, mirroring logical's
 // 60-minute floor on individual backups.
 const recentBackupGracePeriod = 60 * time.Minute
+
+// A chain that fails this many INCR attempts in a row is not recovering on its
+// own: close it so a fresh FULL re-anchors instead of retrying every cadence
+// tick forever. Mirrors the logical scheduler's default MaxFailedTriesCount.
+const maxConsecutiveFailedIncrTries = 3
+
+// How many of the newest FULL attempts the re-anchor brake weighs. None of them
+// completing means the source, not the chain, is what needs attention.
+const recentFullAttemptsWindow = 3

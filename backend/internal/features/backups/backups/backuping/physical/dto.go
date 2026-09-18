@@ -12,10 +12,19 @@ import (
 )
 
 type backupContext struct {
-	Config    *backups_config_physical.PhysicalBackupConfig
-	Database  *databases.Database
+	Config *backups_config_physical.PhysicalBackupConfig
+
+	// The copy reached through the bastion, so everything the run touches — the size probe, the
+	// executor's SourceDB, pg_basebackup — dials the forwarded port off one SSH session.
+	Database *databases.Database
+
 	Storage   *storages.Storage
 	MasterKey string
+	tunnel    *databases.TunneledDatabase
+}
+
+func (c *backupContext) Close() {
+	c.tunnel.Close()
 }
 
 // chainCandidate pairs a non-extendable chain with its end timestamp so passes
@@ -47,4 +56,9 @@ type chainAlert struct {
 	Kind    chainAlertKind
 	Heading string
 	Message string
+}
+
+type CancelInFlightBackupSpec struct {
+	DatabaseID uuid.UUID
+	BackupID   uuid.UUID
 }

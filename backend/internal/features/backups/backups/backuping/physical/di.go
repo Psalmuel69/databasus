@@ -32,8 +32,9 @@ var physicalBackuper = &PhysicalBackuper{
 	physical_repositories.GetWalHistoryRepository(),
 	backups_config_physical.GetBackupConfigService(),
 	storages.GetStorageService(),
+	storages.GetStorageFileStore(),
 	notifiers.GetNotifierService(),
-	tasks_cancellation.GetTaskCancelManager(),
+	tasks_cancellation.GetRegistry(),
 	encryption_secrets.GetSecretKeyService(),
 	logger.GetLogger(),
 	postgresql_executor.NewCreateFullBackupUsecase(),
@@ -48,7 +49,8 @@ var physicalBackupsScheduler = &PhysicalBackupsScheduler{
 	physical_repositories.GetInFlightBackupRepository(),
 	backups_config_physical.GetBackupConfigService(),
 	chain_view.GetChainViewService(),
-	tasks_cancellation.GetTaskCancelManager(),
+	tasks_cancellation.GetRequester(),
+	storages.GetStorageFileStore(),
 	physicalBackuper,
 	atomicTime{},
 	logger.GetLogger(),
@@ -74,11 +76,12 @@ var physicalWalStreamSupervisor = &PhysicalWalStreamSupervisor{
 	databases.GetDatabaseService(),
 	backups_config_physical.GetBackupConfigService(),
 	storages.GetStorageService(),
+	storages.GetStorageFileStore(),
 	physical_repositories.GetWalSegmentRepository(),
 	physical_repositories.GetWalHistoryRepository(),
 	physical_repositories.GetWalStreamerRepository(),
 	notifiers.GetNotifierService(),
-	tasks_cancellation.GetTaskCancelManager(),
+	tasks_cancellation.GetRegistry(),
 	encryption_secrets.GetSecretKeyService(),
 	encryption.GetFieldEncryptor(),
 	logger.GetLogger(),
@@ -103,7 +106,7 @@ var physicalSlotCleanupListener = postgresql_executor.NewPhysicalSlotCleanupList
 
 var physicalBackupCanceller = NewPhysicalBackupCanceller(
 	physical_repositories.GetInFlightBackupRepository(),
-	tasks_cancellation.GetTaskCancelManager(),
+	tasks_cancellation.GetRequester(),
 	logger.GetLogger(),
 )
 
@@ -112,7 +115,7 @@ func GetPhysicalBackupCanceller() *PhysicalBackupCanceller { return physicalBack
 var physicalBackupCancellationListener = &PhysicalBackupCancellationListener{
 	physicalBackupCanceller,
 	physical_repositories.GetWalStreamerRepository(),
-	tasks_cancellation.GetTaskCancelManager(),
+	tasks_cancellation.GetRequester(),
 	logger.GetLogger(),
 }
 
@@ -122,6 +125,10 @@ var SetupDependencies = sync.OnceFunc(func() {
 	// can drop the (now detaching) WAL slot instead of refusing it as active and
 	// leaving it to pin WAL forever.
 	databases.GetDatabaseService().AddDbRemoveListener(physicalBackupCancellationListener)
+	// The cascade that would take the object names away runs only after every
+	// listener has returned.
+	databases.GetDatabaseService().AddDbRemoveListener(physical_service.GetPhysicalBackupService())
+	storages.GetStorageService().AddStorageBackupCounter(physical_service.GetPhysicalBackupService())
 	databases.GetDatabaseService().AddDbRemoveListener(physicalSlotCleanupListener)
-	backups_config_physical.GetBackupConfigService().SetBackupConfigChangeListener(physicalBackupCancellationListener)
+	backups_config_physical.GetBackupConfigService().SetBackupCancellationListener(physicalBackupCancellationListener)
 })

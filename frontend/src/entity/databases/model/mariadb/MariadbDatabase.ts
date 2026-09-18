@@ -1,3 +1,4 @@
+import type { SshTunnelConfig } from '../sshtunnel/SshTunnelConfig';
 import type { MariadbVersion } from './MariadbVersion';
 
 export interface MariadbDatabase {
@@ -9,8 +10,8 @@ export interface MariadbDatabase {
   password: string;
   database?: string;
   isHttps: boolean;
+  sshTunnel?: SshTunnelConfig;
   isExcludeEvents?: boolean;
-  isUseExtendedInsert?: boolean;
   isSkipGaleraDisable?: boolean;
   excludeTables?: string[];
 }

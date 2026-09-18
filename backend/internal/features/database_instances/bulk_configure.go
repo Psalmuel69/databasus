@@ -1,6 +1,7 @@
 package database_instances
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -23,10 +24,11 @@ import (
 // as a manually added database. Failures are collected per item instead of
 // aborting the batch - one unreachable database must not block the other N.
 func (s *DatabaseInstanceService) BulkConfigureBackups(
+	ctx context.Context,
 	user *users_models.User,
 	request *BulkConfigureBackupsRequest,
 ) (*BulkConfigureBackupsResponse, error) {
-	instance, err := s.getAuthorizedInstance(user, request.InstanceID)
+	instance, err := s.getAuthorizedInstance(ctx, user, request.InstanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +37,7 @@ func (s *DatabaseInstanceService) BulkConfigureBackups(
 		return nil, err
 	}
 
-	configured, err := s.findConfiguredDatabases(user, instance)
+	configured, err := s.findConfiguredDatabases(ctx, user, instance)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +59,7 @@ func (s *DatabaseInstanceService) BulkConfigureBackups(
 			continue
 		}
 
-		if err := s.configureSingleDatabase(user, instance, name, request, notifierStubs); err != nil {
+		if err := s.configureSingleDatabase(ctx, user, instance, name, request, notifierStubs); err != nil {
 			response.Failed = append(response.Failed, BulkConfigureFailure{Name: name, Error: err.Error()})
 
 			continue
@@ -107,6 +109,7 @@ func validateBulkRequest(instance *DatabaseInstance, request *BulkConfigureBacku
 }
 
 func (s *DatabaseInstanceService) configureSingleDatabase(
+	ctx context.Context,
 	user *users_models.User,
 	instance *DatabaseInstance,
 	databaseName string,
@@ -125,7 +128,7 @@ func (s *DatabaseInstanceService) configureSingleDatabase(
 
 	database.Notifiers = notifierStubs
 
-	created, err := s.databaseService.CreateDatabase(user, instance.WorkspaceID, database)
+	created, err := s.databaseService.CreateDatabase(ctx, user, instance.WorkspaceID, database)
 	if err != nil {
 		return fmt.Errorf("failed to create database: %w", err)
 	}
@@ -135,14 +138,14 @@ func (s *DatabaseInstanceService) configureSingleDatabase(
 		configCopy := *request.LogicalConfig
 		configCopy.DatabaseID = created.ID
 
-		if _, err := s.backupConfigService.SaveBackupConfigWithAuth(user, &configCopy); err != nil {
+		if _, err := s.backupConfigService.SaveBackupConfigWithAuth(ctx, user, &configCopy); err != nil {
 			return fmt.Errorf("failed to save backup config: %w", err)
 		}
 	case BulkBackupTypePhysical:
 		configCopy := *request.PhysicalConfig
 		configCopy.DatabaseID = created.ID
 
-		if _, err := s.physicalBackupConfigService.SaveBackupConfigWithAuth(user, &configCopy); err != nil {
+		if _, err := s.physicalBackupConfigService.SaveBackupConfigWithAuth(ctx, user, &configCopy); err != nil {
 			return fmt.Errorf("failed to save backup config: %w", err)
 		}
 	}

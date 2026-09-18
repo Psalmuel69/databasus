@@ -3,6 +3,7 @@ package backuping_logical
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"databasus-backend/internal/features/databases"
 	"databasus-backend/internal/features/notifiers"
 	notifier_models "databasus-backend/internal/features/notifiers/models"
-	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 )
 
 type MockNotificationSender struct {
@@ -23,11 +24,14 @@ type MockNotificationSender struct {
 }
 
 func (m *MockNotificationSender) SendNotification(
+	_ context.Context,
 	notifier *notifiers.Notifier,
 	notification notifier_models.Notification,
 ) {
 	m.Called(notifier, notification)
 }
+
+const FakeBackupArtifact = "fake logical backup"
 
 type CreateFailedBackupUsecase struct{}
 
@@ -36,9 +40,9 @@ func (uc *CreateFailedBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	backupProgressListener(10)
 	return nil, errors.New("backup failed")
 }
@@ -50,15 +54,12 @@ func (uc *CreateSuccessBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	backupProgressListener(10)
-	return &backups_core_logical.BackupMetadata{
-		EncryptionSalt: nil,
-		EncryptionIV:   nil,
-		Encryption:     backups_core_enums.BackupEncryptionNone,
-	}, nil
+
+	return writeFakeBackupArtifact(ctx, backup, fileStore)
 }
 
 // CreateLargeBackupUsecase simulates a large backup (10000 MB)
@@ -69,15 +70,12 @@ func (uc *CreateLargeBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	backupProgressListener(10000)
-	return &backups_core_logical.BackupMetadata{
-		EncryptionSalt: nil,
-		EncryptionIV:   nil,
-		Encryption:     backups_core_enums.BackupEncryptionNone,
-	}, nil
+
+	return writeFakeBackupArtifact(ctx, backup, fileStore)
 }
 
 // CreateProgressiveBackupUsecase simulates progressive size updates that exceed limit
@@ -88,9 +86,9 @@ func (uc *CreateProgressiveBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	// Simulate progressive backup that grows beyond limit
 	backupProgressListener(1)
 	if ctx.Err() != nil {
@@ -113,11 +111,7 @@ func (uc *CreateProgressiveBackupUsecase) Execute(
 	}
 
 	// Should not reach here due to cancellation
-	return &backups_core_logical.BackupMetadata{
-		EncryptionSalt: nil,
-		EncryptionIV:   nil,
-		Encryption:     backups_core_enums.BackupEncryptionNone,
-	}, nil
+	return writeFakeBackupArtifact(ctx, backup, fileStore)
 }
 
 // CreateMediumBackupUsecase simulates a 50 MB backup
@@ -128,15 +122,11 @@ func (uc *CreateMediumBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	backupProgressListener(50)
-	return &backups_core_logical.BackupMetadata{
-		EncryptionSalt: nil,
-		EncryptionIV:   nil,
-		Encryption:     backups_core_enums.BackupEncryptionNone,
-	}, nil
+	return writeFakeBackupArtifact(ctx, backup, fileStore)
 }
 
 // MockTrackingBackupUsecase tracks backup use case calls for testing parallel execution
@@ -156,9 +146,9 @@ func (m *MockTrackingBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	database *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
+) (*backups_core_logical.BackupArtifacts, error) {
 	m.callCount.Add(1)
 
 	// Send backup ID to channel (non-blocking)
@@ -171,11 +161,7 @@ func (m *MockTrackingBackupUsecase) Execute(
 	time.Sleep(100 * time.Millisecond)
 	backupProgressListener(10)
 
-	return &backups_core_logical.BackupMetadata{
-		EncryptionSalt: nil,
-		EncryptionIV:   nil,
-		Encryption:     backups_core_enums.BackupEncryptionNone,
-	}, nil
+	return writeFakeBackupArtifact(ctx, backup, fileStore)
 }
 
 func (m *MockTrackingBackupUsecase) GetCallCount() int32 {
@@ -192,4 +178,27 @@ func (m *MockTrackingBackupUsecase) GetCalledBackupIDs() []uuid.UUID {
 			return ids
 		}
 	}
+}
+
+// The fakes stand in for a database dump, so they write a real file through the
+// store: a backuper test that never produced an artifact could not tell a kept
+// file from a cleaned one.
+func writeFakeBackupArtifact(
+	ctx context.Context,
+	backup *backups_core_logical.LogicalBackup,
+	fileStore backups_core_logical.BackupFileStore,
+) (*backups_core_logical.BackupArtifacts, error) {
+	receipt, err := fileStore.WriteFile(
+		ctx,
+		storage_files.StoredFileReference{StorageID: backup.StorageID, FileName: backup.FileName},
+		strings.NewReader(FakeBackupArtifact),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &backups_core_logical.BackupArtifacts{
+		Metadata: &backups_core_logical.BackupMetadata{Encryption: backups_core_enums.BackupEncryptionNone},
+		Receipts: []storage_files.WriteReceipt{receipt},
+	}, nil
 }

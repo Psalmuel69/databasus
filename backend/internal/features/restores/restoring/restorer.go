@@ -16,62 +16,61 @@ import (
 	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	tasks_cancellation "databasus-backend/internal/features/tasks/cancellation"
-	cache_utils "databasus-backend/internal/util/cache"
+	"databasus-backend/internal/util/cache"
 	util_encryption "databasus-backend/internal/util/encryption"
 )
 
 type Restorer struct {
-	databaseService      *databases.DatabaseService
-	backupService        *backups_services.LogicalBackupService
-	fieldEncryptor       util_encryption.FieldEncryptor
-	restoreRepository    *restores_core.RestoreRepository
-	backupConfigService  *backups_config_logical.BackupConfigService
-	storageService       *storages.StorageService
-	logger               *slog.Logger
-	restoreBackupUsecase restores_core.RestoreBackupUsecase
-	cacheUtil            *cache_utils.CacheUtil[RestoreDatabaseCache]
-	restoreCancelManager *tasks_cancellation.TaskCancelManager
+	databaseService          *databases.DatabaseService
+	backupService            *backups_services.LogicalBackupService
+	fieldEncryptor           util_encryption.FieldEncryptor
+	restoreRepository        *restores_core.RestoreRepository
+	backupConfigService      *backups_config_logical.BackupConfigService
+	storageService           *storages.StorageService
+	logger                   *slog.Logger
+	restoreBackupUsecase     restores_core.RestoreBackupUsecase
+	restoreDatabaseCache     *cache.JSONStore[RestoreDatabaseCache]
+	taskCancellationRegistry *tasks_cancellation.Registry
 }
 
-func (r *Restorer) MakeRestore(restoreID uuid.UUID) {
-	// Get and delete cached DB credentials atomically
-	dbCache := r.cacheUtil.GetAndDelete(restoreID.String())
+type restoreMetadataLookup struct {
+	restoreID             uuid.UUID
+	fallbackDatabaseCache *RestoreDatabaseCache
+}
 
-	if dbCache == nil {
-		// Cache miss - fail immediately
-		restore, err := r.restoreRepository.FindByID(restoreID)
-		if err != nil {
-			r.logger.Error(
-				"Failed to get restore by ID after cache miss",
-				"restoreId",
-				restoreID,
-				"error",
-				err,
-			)
-			return
-		}
-
-		errMsg := "Database credentials expired or missing from cache (most likely due to instance restart)"
-		restore.FailMessage = &errMsg
-		restore.Status = restores_core.RestoreStatusFailed
-
-		if err := r.restoreRepository.Save(restore); err != nil {
-			r.logger.Error("Failed to save restore after cache miss", "error", err)
-		}
-
-		r.logger.Error("Restore failed: cache miss", "restoreId", restoreID)
-		return
-	}
+func (r *Restorer) MakeRestore(
+	ctx context.Context,
+	restoreID uuid.UUID,
+	fallbackDatabaseCache *RestoreDatabaseCache,
+) {
+	logger := r.logger.With("restore_id", restoreID)
 
 	restore, err := r.restoreRepository.FindByID(restoreID)
 	if err != nil {
-		r.logger.Error("Failed to get restore by ID", "restoreId", restoreID, "error", err)
+		logger.ErrorContext(ctx, "failed to get restore by ID", "error", err)
+		return
+	}
+
+	databaseCache := r.getRestoreDatabaseCache(ctx, restoreMetadataLookup{
+		restoreID:             restore.ID,
+		fallbackDatabaseCache: fallbackDatabaseCache,
+	}, logger)
+	if !databaseCache.HasDatabaseConfiguration() {
+		failMessage := "Database credentials expired or missing from cache (most likely due to instance restart)"
+		restore.FailMessage = &failMessage
+		restore.Status = restores_core.RestoreStatusFailed
+		if err := r.restoreRepository.Save(restore); err != nil {
+			logger.ErrorContext(ctx, "failed to save restore after missing metadata", "error", err)
+		}
+
+		logger.ErrorContext(ctx, "restore failed because database credentials are missing")
+
 		return
 	}
 
 	backup, err := r.backupService.GetBackup(restore.BackupID)
 	if err != nil {
-		r.logger.Error("Failed to get backup by ID", "backupId", restore.BackupID, "error", err)
+		logger.ErrorContext(ctx, "failed to get backup by ID", "backup_id", restore.BackupID, "error", err)
 		return
 	}
 
@@ -79,51 +78,79 @@ func (r *Restorer) MakeRestore(restoreID uuid.UUID) {
 
 	database, err := r.databaseService.GetDatabaseByID(databaseID)
 	if err != nil {
-		r.logger.Error("Failed to get database by ID", "databaseId", databaseID, "error", err)
+		logger.ErrorContext(ctx, "failed to get database by ID", "database_id", databaseID, "error", err)
 		return
 	}
 
 	backupConfig, err := r.backupConfigService.GetBackupConfigByDbId(databaseID)
 	if err != nil {
-		r.logger.Error("Failed to get backup config by database ID", "error", err)
+		logger.ErrorContext(ctx, "failed to get backup config by database ID", "error", err)
 		return
 	}
 
 	if backupConfig.StorageID == nil {
-		r.logger.Error("Backup config storage ID is not defined")
+		logger.ErrorContext(ctx, "backup config storage ID is not defined")
 		return
 	}
 
-	storage, err := r.storageService.GetStorageByID(*backupConfig.StorageID)
+	// Detached from the caller so a finished HTTP request cannot cancel a running restore.
+	executionCtx, cancel := context.WithCancel(context.Background())
+	r.taskCancellationRegistry.RegisterTask(restore.ID, cancel)
+	defer r.taskCancellationRegistry.UnregisterTask(restore.ID)
+
+	storage, err := r.storageService.GetStorageByID(executionCtx, *backupConfig.StorageID)
 	if err != nil {
-		r.logger.Error("Failed to get storage by ID", "error", err)
+		logger.ErrorContext(ctx, "failed to get storage by ID", "error", err)
 		return
 	}
 
 	start := time.Now().UTC()
 
-	// Create cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
-	r.restoreCancelManager.RegisterTask(restore.ID, cancel)
-	defer r.restoreCancelManager.UnregisterTask(restore.ID)
-
 	// Create restoring database from cached credentials
 	restoringToDB := &databases.Database{
 		Type:              database.Type,
-		PostgresqlLogical: dbCache.PostgresqlLogicalDatabase,
-		Mysql:             dbCache.MysqlDatabase,
-		Mariadb:           dbCache.MariadbDatabase,
-		Mongodb:           dbCache.MongodbDatabase,
+		PostgresqlLogical: databaseCache.PostgresqlLogicalDatabase,
+		Mysql:             databaseCache.MysqlDatabase,
+		Mariadb:           databaseCache.MariadbDatabase,
+		Mongodb:           databaseCache.MongodbDatabase,
 	}
 
-	if err := restoringToDB.PopulateDbData(r.logger, r.fieldEncryptor); err != nil {
+	// The restore target is the only endpoint this function connects to, so one tunnel covers
+	// version detection, the TimescaleDB hooks and pg_restore itself.
+	tunneledDatabase, err := databases.OpenTunnel(executionCtx, databases.OpenTunnelSpec{
+		Database:  restoringToDB,
+		Logger:    logger,
+		Encryptor: r.fieldEncryptor,
+	})
+	if err != nil {
+		errMsg := fmt.Sprintf("failed to open the SSH tunnel to the restore target: %v", err)
+		restore.FailMessage = &errMsg
+		restore.Status = restores_core.RestoreStatusFailed
+		restore.RestoreDurationMs = time.Since(start).Milliseconds()
+
+		logger.ErrorContext(ctx, "restore failed to open the ssh tunnel to the target", "error", err)
+
+		if err := r.restoreRepository.Save(restore); err != nil {
+			logger.ErrorContext(ctx, "failed to save restore", "error", err)
+		}
+
+		return
+	}
+
+	defer tunneledDatabase.Close()
+
+	restoringToDBThroughTunnel := tunneledDatabase.GetDatabaseThroughTunnel()
+
+	if err := restoringToDBThroughTunnel.PopulateDbData(logger, r.fieldEncryptor); err != nil {
 		errMsg := fmt.Sprintf("failed to auto-detect database data: %v", err)
 		restore.FailMessage = &errMsg
 		restore.Status = restores_core.RestoreStatusFailed
 		restore.RestoreDurationMs = time.Since(start).Milliseconds()
 
+		logger.ErrorContext(ctx, "restore failed to auto-detect target database data", "error", err)
+
 		if err := r.restoreRepository.Save(restore); err != nil {
-			r.logger.Error("Failed to save restore", "error", err)
+			logger.ErrorContext(ctx, "failed to save restore", "error", err)
 		}
 
 		return
@@ -132,19 +159,22 @@ func (r *Restorer) MakeRestore(restoreID uuid.UUID) {
 	// IsExcludeExtensions is a transient choice carried on the target config from the restore
 	// request; IsSkipUserMappings is a persisted property of the source database being restored.
 	restoreOptions := restores_core.RestoreOptions{}
-	if dbCache.PostgresqlLogicalDatabase != nil {
-		restoreOptions.IsExcludeExtensions = dbCache.PostgresqlLogicalDatabase.IsExcludeExtensions
+	if databaseCache.PostgresqlLogicalDatabase != nil {
+		restoreOptions.IsExcludeExtensions = databaseCache.PostgresqlLogicalDatabase.IsExcludeExtensions
 	}
 	if database.PostgresqlLogical != nil {
 		restoreOptions.IsSkipUserMappings = database.PostgresqlLogical.IsSkipUserMappings
 	}
 
+	logger.InfoContext(ctx, fmt.Sprintf("restore started: %s database %q", database.Type, database.Name),
+		"backup_id", backup.ID, "database_id", databaseID, "storage_id", storage.ID)
+
 	err = r.restoreBackupUsecase.Execute(
-		ctx,
+		executionCtx,
 		backupConfig,
 		*restore,
 		database,
-		restoringToDB,
+		restoringToDBThroughTunnel,
 		backup,
 		storage,
 		restoreOptions,
@@ -159,31 +189,28 @@ func (r *Restorer) MakeRestore(restoreID uuid.UUID) {
 		isShutdown := strings.Contains(errMsg, "shutdown")
 
 		if isCancelled && !isShutdown {
-			r.logger.Warn("Restore was cancelled by user or system",
-				"restoreId", restore.ID,
-				"isCancelled", isCancelled,
-				"isShutdown", isShutdown,
+			logger.WarnContext(ctx, "restore was cancelled by user or system",
+				"is_cancelled", isCancelled,
+				"is_shutdown", isShutdown,
 			)
 
 			restore.Status = restores_core.RestoreStatusCanceled
 			restore.RestoreDurationMs = time.Since(start).Milliseconds()
 
 			if err := r.restoreRepository.Save(restore); err != nil {
-				r.logger.Error("Failed to save cancelled restore", "error", err)
+				logger.ErrorContext(ctx, "failed to save cancelled restore", "error", err)
 			}
 
 			return
 		}
 
-		r.logger.Error("Restore execution failed",
-			"restoreId", restore.ID,
-			"backupId", backup.ID,
-			"databaseId", databaseID,
-			"databaseType", database.Type,
-			"storageId", storage.ID,
-			"storageType", storage.Type,
+		logger.ErrorContext(ctx, "restore execution failed",
+			"backup_id", backup.ID,
+			"database_id", databaseID,
+			"database_type", database.Type,
+			"storage_id", storage.ID,
+			"storage_type", storage.Type,
 			"error", err,
-			"errorMessage", errMsg,
 		)
 
 		restore.FailMessage = &errMsg
@@ -191,7 +218,7 @@ func (r *Restorer) MakeRestore(restoreID uuid.UUID) {
 		restore.RestoreDurationMs = time.Since(start).Milliseconds()
 
 		if err := r.restoreRepository.Save(restore); err != nil {
-			r.logger.Error("Failed to save restore", "error", err)
+			logger.ErrorContext(ctx, "failed to save restore", "error", err)
 		}
 
 		return
@@ -201,14 +228,29 @@ func (r *Restorer) MakeRestore(restoreID uuid.UUID) {
 	restore.RestoreDurationMs = time.Since(start).Milliseconds()
 
 	if err := r.restoreRepository.Save(restore); err != nil {
-		r.logger.Error("Failed to save restore", "error", err)
+		logger.ErrorContext(ctx, "failed to save restore", "error", err)
 		return
 	}
 
-	r.logger.Info(
-		"Restore completed successfully",
-		"restoreId", restore.ID,
-		"backupId", backup.ID,
-		"durationMs", restore.RestoreDurationMs,
-	)
+	logger.InfoContext(ctx, fmt.Sprintf("restore finished in %d ms", restore.RestoreDurationMs),
+		"backup_id", backup.ID)
+}
+
+func (r *Restorer) getRestoreDatabaseCache(
+	ctx context.Context,
+	lookup restoreMetadataLookup,
+	logger *slog.Logger,
+) *RestoreDatabaseCache {
+	databaseCache, err := r.restoreDatabaseCache.ReadAndDelete(ctx, lookup.restoreID.String())
+	if err != nil {
+		logger.WarnContext(ctx, "failed to read restore metadata from cache", "error", err)
+	}
+	if databaseCache != nil {
+		return databaseCache
+	}
+	if lookup.fallbackDatabaseCache != nil {
+		return lookup.fallbackDatabaseCache
+	}
+
+	return &RestoreDatabaseCache{}
 }

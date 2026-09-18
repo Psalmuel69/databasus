@@ -6,11 +6,14 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+
 	chain_view "databasus-backend/internal/features/backups/backups/core/physical/chain_view"
 	physical_enums "databasus-backend/internal/features/backups/backups/core/physical/enums"
 	postgresql_shared "databasus-backend/internal/features/databases/databases/postgresql/shared"
-	"databasus-backend/internal/features/storages"
-	util_encryption "databasus-backend/internal/util/encryption"
+	storage_files "databasus-backend/internal/features/storages/files"
+	db "databasus-backend/internal/storage"
 )
 
 type CreateFullBackupUsecase struct{}
@@ -32,34 +35,38 @@ func (uc *CreateFullBackupUsecase) Execute(ctx context.Context, spec FullBackupS
 	}
 	defer creds.Remove()
 
-	// nil onFailover: a detected failover does not refuse a FULL — it proceeds on
-	// the live TL, and the scheduler observes the bumped TL across two FULL rows.
-	refusalResult, canProceed := verifyTimelineCompatibility(ctx, spec.CommonBackupSpec, nil)
+	refusalResult, preflightTimelineID, canProceed := verifyFullTimelineCompatibility(ctx, spec.CommonBackupSpec)
 	if !canProceed {
 		return refusalResult, nil
 	}
 
-	fileName := buildObjectName(spec.DatabaseName, spec.Backup.ID, start, "FULL")
+	label := buildBackupLabel(spec.DatabaseName, spec.Backup.ID, start, "FULL")
 
-	spec.Backup.FileName = &fileName
-	if err := spec.FullRepo.Save(spec.Backup); err != nil {
-		return errorResult(physical_enums.PhysicalBackupErrorStorageUploadFailed,
-			"persist file_name at upload-start", err), nil
+	// Every codec attempt gets its own object key, and the row has to carry it
+	// before the bytes leave, or a failed attempt leaves a file nothing names.
+	mintAndSaveAttemptName := func() (string, error) {
+		attemptName := buildObjectName(label, uuid.New())
+
+		spec.Backup.FileName = &attemptName
+		if err := spec.FullRepo.Save(spec.Backup); err != nil {
+			return "", fmt.Errorf("persist file_name at upload-start: %w", err)
+		}
+
+		return attemptName, nil
 	}
-
 	var result PhysicalBackupResult
 
 	slotErr := WithBackupSlot(ctx, spec.SourceDB, spec.FieldEncryptor, spec.Logger, func() error {
-		streamResult, err := streamWithCodecFallback(
-			ctx,
-			spec.CommonBackupSpec,
-			spec.Backup.ID,
-			creds,
-			fileName,
-			spec.SourceDB.SystemIdentifierUint64(),
-			"",
-			classifyFullStreamError,
-		)
+		streamResult, err := streamWithCodecFallback(ctx, streamAttemptSpec{
+			Common:                  spec.CommonBackupSpec,
+			BackupID:                spec.Backup.ID,
+			Creds:                   creds,
+			Label:                   label,
+			SystemID:                spec.SourceDB.SystemIdentifierUint64(),
+			IncrementalManifestPath: "",
+			Classify:                classifyFullStreamError,
+			MintAndSaveAttemptName:  mintAndSaveAttemptName,
+		})
 		if err != nil {
 			result = errorResult(physical_enums.PhysicalBackupErrorPgBasebackupFailed,
 				"pg_basebackup stream", err)
@@ -67,7 +74,7 @@ func (uc *CreateFullBackupUsecase) Execute(ctx context.Context, spec FullBackupS
 		}
 
 		if streamResult.Status != physical_enums.PhysicalBackupStatusCompleted {
-			result = streamResult
+			result = recheckFullStreamFailure(ctx, spec.CommonBackupSpec, preflightTimelineID, streamResult)
 			return nil
 		}
 
@@ -83,7 +90,8 @@ func (uc *CreateFullBackupUsecase) Execute(ctx context.Context, spec FullBackupS
 		}
 
 		if validation.Status == chain_view.ValidationStatusChainBroken {
-			removeUploadedArtifactsAfterChainBroken(spec.Storage, spec.FieldEncryptor, fileName, spec.Logger)
+			discardArtifactsAfterChainBroken(
+				ctx, spec.FileStore, spec.StorageID, streamResult.FileName, spec.Logger)
 
 			reason := physical_enums.PhysicalBackupErrorStartLsnOutsideTimeline
 
@@ -91,7 +99,7 @@ func (uc *CreateFullBackupUsecase) Execute(ctx context.Context, spec FullBackupS
 				Status:       physical_enums.PhysicalBackupStatusChainBroken,
 				ErrorReason:  &reason,
 				ErrorMessage: validation.Message,
-				FileName:     fileName,
+				FileName:     streamResult.FileName,
 				TimelineID:   streamResult.TimelineID,
 				StartLSN:     streamResult.StartLSN,
 				StopLSN:      streamResult.StopLSN,
@@ -112,15 +120,16 @@ func (uc *CreateFullBackupUsecase) Execute(ctx context.Context, spec FullBackupS
 
 		streamResult.BackupDurationMs = time.Since(start).Milliseconds()
 		streamResult.CompletedAt = time.Now().UTC()
-		streamResult.FileName = fileName
 
-		if err := uploadFullMetadata(
-			spec.Logger, spec.FieldEncryptor, spec.Storage, spec.SourceDB, spec.Backup, streamResult,
-		); err != nil {
+		metadataReceipt, err := uploadFullMetadata(
+			spec.Logger, spec.FileStore, spec.StorageID, spec.SourceDB, spec.Backup, streamResult,
+		)
+		if err != nil {
 			result = errorResult(physical_enums.PhysicalBackupErrorStorageUploadFailed, "upload metadata", err)
 			return nil
 		}
 
+		streamResult.Receipts = append(streamResult.Receipts, metadataReceipt)
 		result = streamResult
 
 		return nil
@@ -149,19 +158,18 @@ func uploadHistoryForTimelineSwitch(ctx context.Context, common CommonBackupSpec
 	}
 	defer func() { _ = historyConn.Close(ctx) }()
 
-	if _, err := UploadHistoryFile(
-		ctx,
-		historyConn,
-		timelineID,
-		common.Storage,
-		common.SourceDB,
-		common.StorageID,
-		common.HistoryRepo,
-		common.Encryption,
-		common.MasterKey,
-		common.FieldEncryptor,
-		common.Logger,
-	); err != nil {
+	if _, err := UploadHistoryFile(ctx, HistoryUploadSpec{
+		Conn:           historyConn,
+		TimelineID:     timelineID,
+		FileStore:      common.FileStore,
+		SourceDB:       common.SourceDB,
+		StorageID:      common.StorageID,
+		HistoryRepo:    common.HistoryRepo,
+		Encryption:     common.Encryption,
+		MasterKey:      common.MasterKey,
+		FieldEncryptor: common.FieldEncryptor,
+		Logger:         common.Logger,
+	}); err != nil {
 		common.Logger.Warn("history upload failed; FULL stays COMPLETED",
 			"timeline_id", timelineID,
 			"error", err)
@@ -178,28 +186,26 @@ func classifyFullStreamError(streamErr error, stderr []byte) streamOutcome {
 	}
 }
 
-// removeUploadedArtifactsAfterChainBroken deletes the streamed artifact and its
-// reconstructed-manifest sidecar after a post-stream CHAIN_BROKEN verdict, so a
-// rejected FULL leaves nothing dangling in storage. The .metadata sidecar is not
-// touched here: it is written only after this point (see uploadFullMetadata), so
-// it does not yet exist. DeleteFile is idempotent on not-found.
-func removeUploadedArtifactsAfterChainBroken(
-	storage storages.StorageFileSaver,
-	encryptor util_encryption.FieldEncryptor,
+// A rejected FULL keeps nothing: its streamed artifact and reconstructed manifest
+// go back to cleanup. The .metadata sidecar is written only after this point, so
+// naming it here would only cost one idempotent provider call.
+func discardArtifactsAfterChainBroken(
+	ctx context.Context,
+	fileStore *storage_files.Store,
+	storageID uuid.UUID,
 	fileName string,
 	logger *slog.Logger,
 ) {
-	manifestName := fileName + manifestSuffix
-
-	if err := storage.DeleteFile(encryptor, manifestName); err != nil {
-		logger.Warn("failed to remove manifest after CHAIN_BROKEN",
-			"file_name", manifestName,
-			"error", err)
+	references := []storage_files.StoredFileReference{
+		{StorageID: storageID, FileName: fileName},
+		{StorageID: storageID, FileName: fileName + manifestSuffix},
 	}
 
-	if err := storage.DeleteFile(encryptor, fileName); err != nil {
-		logger.Warn("failed to remove artifact after CHAIN_BROKEN",
-			"file_name", fileName,
-			"error", err)
+	ctx = context.WithoutCancel(ctx)
+
+	if err := db.GetDb().Transaction(func(tx *gorm.DB) error {
+		return fileStore.RequestFileDeletions(ctx, tx, references)
+	}); err != nil {
+		logger.Warn("failed to discard artifacts after CHAIN_BROKEN", "file_name", fileName, "error", err)
 	}
 }

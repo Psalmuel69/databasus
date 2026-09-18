@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	audit_logs "databasus-backend/internal/features/audit_logs"
+	audit_logs_models "databasus-backend/internal/features/audit_logs/models"
 	backups_config_logical "databasus-backend/internal/features/backups/config/logical"
 	backups_config_physical "databasus-backend/internal/features/backups/config/physical"
 	"databasus-backend/internal/features/databases"
@@ -32,11 +33,12 @@ type DatabaseInstanceService struct {
 }
 
 func (s *DatabaseInstanceService) RegisterInstance(
+	ctx context.Context,
 	user *users_models.User,
 	workspaceID uuid.UUID,
 	instance *DatabaseInstance,
 ) (*DatabaseInstance, error) {
-	canManage, err := s.workspaceService.CanUserManageDBs(workspaceID, user)
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, workspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +53,7 @@ func (s *DatabaseInstanceService) RegisterInstance(
 		return nil, err
 	}
 
-	if err := s.testConnection(instance); err != nil {
+	if err := s.testConnection(ctx, instance); err != nil {
 		return nil, fmt.Errorf("connection test failed: %w", err)
 	}
 
@@ -64,20 +66,21 @@ func (s *DatabaseInstanceService) RegisterInstance(
 		return nil, err
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database instance registered: %s", instance.Name),
-		&user.ID,
-		&workspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message:     fmt.Sprintf("Database instance registered: %s", instance.Name),
+		UserID:      &user.ID,
+		WorkspaceID: &workspaceID,
+	})
 
 	return instance, nil
 }
 
 func (s *DatabaseInstanceService) UpdateInstance(
+	ctx context.Context,
 	user *users_models.User,
 	incoming *DatabaseInstance,
 ) (*DatabaseInstance, error) {
-	existing, err := s.getAuthorizedInstance(user, incoming.ID)
+	existing, err := s.getAuthorizedInstance(ctx, user, incoming.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +94,7 @@ func (s *DatabaseInstanceService) UpdateInstance(
 	// After Update, fields may be mixed plaintext (newly set) and ciphertext
 	// (untouched). Decrypt passes plaintext through unchanged and
 	// EncryptSensitiveFields skips already-encrypted values, so both states are safe.
-	if err := s.testConnection(existing); err != nil {
+	if err := s.testConnection(ctx, existing); err != nil {
 		return nil, fmt.Errorf("connection test failed: %w", err)
 	}
 
@@ -104,20 +107,21 @@ func (s *DatabaseInstanceService) UpdateInstance(
 		return nil, err
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database instance updated: %s", updated.Name),
-		&user.ID,
-		&updated.WorkspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message:     fmt.Sprintf("Database instance updated: %s", updated.Name),
+		UserID:      &user.ID,
+		WorkspaceID: &updated.WorkspaceID,
+	})
 
 	return updated, nil
 }
 
 func (s *DatabaseInstanceService) GetInstancesByWorkspace(
+	ctx context.Context,
 	user *users_models.User,
 	workspaceID uuid.UUID,
 ) ([]*DatabaseInstance, error) {
-	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(workspaceID, user)
+	canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(ctx, workspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -139,10 +143,11 @@ func (s *DatabaseInstanceService) GetInstancesByWorkspace(
 }
 
 func (s *DatabaseInstanceService) GetInstance(
+	ctx context.Context,
 	user *users_models.User,
 	instanceID uuid.UUID,
 ) (*DatabaseInstance, error) {
-	instance, err := s.getAuthorizedInstance(user, instanceID)
+	instance, err := s.getAuthorizedInstance(ctx, user, instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -153,10 +158,11 @@ func (s *DatabaseInstanceService) GetInstance(
 }
 
 func (s *DatabaseInstanceService) DeleteInstance(
+	ctx context.Context,
 	user *users_models.User,
 	instanceID uuid.UUID,
 ) error {
-	instance, err := s.getAuthorizedInstance(user, instanceID)
+	instance, err := s.getAuthorizedInstance(ctx, user, instanceID)
 	if err != nil {
 		return err
 	}
@@ -165,11 +171,11 @@ func (s *DatabaseInstanceService) DeleteInstance(
 		return err
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database instance deleted: %s", instance.Name),
-		&user.ID,
-		&instance.WorkspaceID,
-	)
+	s.auditLogService.WriteAuditLog(ctx, audit_logs_models.AuditEntry{
+		Message:     fmt.Sprintf("Database instance deleted: %s", instance.Name),
+		UserID:      &user.ID,
+		WorkspaceID: &instance.WorkspaceID,
+	})
 
 	return nil
 }
@@ -178,10 +184,11 @@ func (s *DatabaseInstanceService) DeleteInstance(
 // returns every database the instance credentials can access. It intentionally
 // does not create Database rows - selection and configuration happen later.
 func (s *DatabaseInstanceService) DiscoverDatabases(
+	ctx context.Context,
 	user *users_models.User,
 	instanceID uuid.UUID,
 ) (*DiscoverDatabasesResponse, error) {
-	instance, err := s.getAuthorizedInstance(user, instanceID)
+	instance, err := s.getAuthorizedInstance(ctx, user, instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -191,17 +198,17 @@ func (s *DatabaseInstanceService) DiscoverDatabases(
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
+	discoveryCtx, cancel := context.WithTimeout(ctx, discoveryTimeout)
 	defer cancel()
 
-	databases, err := provider.DiscoverDatabases(ctx, instance, s.fieldEncryptor)
+	databases, err := provider.DiscoverDatabases(discoveryCtx, instance, s.fieldEncryptor)
 	if err != nil {
 		s.logger.Error("Database discovery failed", "instanceId", instanceID, "error", err)
 
 		return nil, fmt.Errorf("discovery failed: %w", err)
 	}
 
-	configured, err := s.findConfiguredDatabases(user, instance)
+	configured, err := s.findConfiguredDatabases(ctx, user, instance)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +233,7 @@ func (s *DatabaseInstanceService) DiscoverDatabases(
 }
 
 func (s *DatabaseInstanceService) getAuthorizedInstance(
+	ctx context.Context,
 	user *users_models.User,
 	instanceID uuid.UUID,
 ) (*DatabaseInstance, error) {
@@ -234,7 +242,7 @@ func (s *DatabaseInstanceService) getAuthorizedInstance(
 		return nil, err
 	}
 
-	canManage, err := s.workspaceService.CanUserManageDBs(instance.WorkspaceID, user)
+	canManage, err := s.workspaceService.CanUserManageDBs(ctx, instance.WorkspaceID, user)
 	if err != nil {
 		return nil, err
 	}
@@ -248,16 +256,16 @@ func (s *DatabaseInstanceService) getAuthorizedInstance(
 
 // testConnection reuses discovery as the connectivity probe: if the catalog
 // query succeeds, the credentials, network path, and permissions all work.
-func (s *DatabaseInstanceService) testConnection(instance *DatabaseInstance) error {
+func (s *DatabaseInstanceService) testConnection(ctx context.Context, instance *DatabaseInstance) error {
 	provider, err := GetDiscoveryProvider(instance.Type)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	_, err = provider.DiscoverDatabases(ctx, instance, s.fieldEncryptor)
+	_, err = provider.DiscoverDatabases(probeCtx, instance, s.fieldEncryptor)
 
 	return err
 }

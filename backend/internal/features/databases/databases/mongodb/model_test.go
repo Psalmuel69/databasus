@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/testing/containers"
 	"databasus-backend/internal/util/tools"
 )
@@ -48,13 +49,27 @@ func Test_MongodbModel_AcrossSupportedVersions(t *testing.T) {
 				testTestConnectionSufficientPermissions(t, endpoint, dbVersion.version)
 			})
 
-			t.Run("Test_IsUserReadOnly_AdminUser_ReturnsFalse", func(t *testing.T) {
-				testIsUserReadOnlyAdminUser(t, endpoint, dbVersion.version)
+			t.Run("Test_ShouldSuggestReadOnlyUser_AdminUser_ReturnsTrue", func(t *testing.T) {
+				testShouldSuggestReadOnlyUserAdminUser(t, endpoint, dbVersion.version)
 			})
 
 			t.Run("Test_CreateReadOnlyUser_UserCanReadButNotWrite", func(t *testing.T) {
 				testCreateReadOnlyUserCanReadButNotWrite(t, endpoint, dbVersion.version)
 			})
+
+			t.Run(
+				"Test_TestConnection_WhenFindIsGrantedOnSingleCollection_ReturnsErrorUntilCollectionIsExcluded",
+				func(t *testing.T) {
+					testTestConnectionFindGrantedOnSingleCollection(t, endpoint, dbVersion.version)
+				},
+			)
+
+			t.Run(
+				"Test_TestConnection_WhenClusterRoleNameLivesOnAnotherDatabase_ReturnsError",
+				func(t *testing.T) {
+					testTestConnectionClusterRoleNameOnAnotherDatabase(t, endpoint, dbVersion.version)
+				},
+			)
 		})
 	}
 }
@@ -161,7 +176,7 @@ func testTestConnectionSufficientPermissions(
 	assert.NoError(t, err)
 }
 
-func testIsUserReadOnlyAdminUser(
+func testShouldSuggestReadOnlyUserAdminUser(
 	t *testing.T,
 	endpoint containers.Endpoint,
 	version tools.MongodbVersion,
@@ -173,13 +188,13 @@ func testIsUserReadOnlyAdminUser(
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	ctx := t.Context()
 
-	isReadOnly, roles, err := mongodbModel.IsUserReadOnly(ctx, logger, nil)
+	shouldSuggestReadOnlyUser, roles, err := mongodbModel.ShouldSuggestReadOnlyUser(ctx, logger, nil)
 	assert.NoError(t, err)
-	assert.False(t, isReadOnly, "Root user should not be read-only")
+	assert.True(t, shouldSuggestReadOnlyUser, "Root user must be offered a read-only user")
 	assert.NotEmpty(t, roles, "Root user should have roles")
 }
 
-func Test_IsUserReadOnly_ReadOnlyUser_ReturnsTrue(t *testing.T) {
+func Test_ShouldSuggestReadOnlyUser_ReadOnlyUser_ReturnsFalse(t *testing.T) {
 	container := connectToMongodbContainer(t, "mongo:7.0", tools.MongodbVersion7)
 	defer container.Client.Disconnect(t.Context())
 
@@ -208,9 +223,9 @@ func Test_IsUserReadOnly_ReadOnlyUser_ReturnsTrue(t *testing.T) {
 		CpuCount:     1,
 	}
 
-	isReadOnly, roles, err := readOnlyModel.IsUserReadOnly(ctx, logger, nil)
+	shouldSuggestReadOnlyUser, roles, err := readOnlyModel.ShouldSuggestReadOnlyUser(ctx, logger, nil)
 	assert.NoError(t, err)
-	assert.True(t, isReadOnly, "Read-only user should be read-only")
+	assert.False(t, shouldSuggestReadOnlyUser, "Read-only user must not be offered another one")
 	assert.NotEmpty(t, roles, "Read-only user should have roles (read, backup)")
 
 	dropUserSafe(container.Client, username, container.AuthDatabase)
@@ -836,4 +851,37 @@ func Test_MapMongodbVersion_VersionMatrix_ReturnsExpected(t *testing.T) {
 			assert.Equal(t, tc.wantVersion, got)
 		})
 	}
+}
+
+func srvDatabase() *MongodbDatabase {
+	return &MongodbDatabase{
+		Host:         "cluster0.example.mongodb.net",
+		Port:         nil,
+		Username:     "testuser",
+		Password:     "testpass123",
+		Database:     "mydb",
+		AuthDatabase: "admin",
+		CpuCount:     1,
+		IsSrv:        true,
+	}
+}
+
+func Test_Validate_WhenSrvIsEnabledBehindAnSshTunnel_IsRejected(t *testing.T) {
+	model := srvDatabase()
+	model.SshTunnel = sshtunnel.Config{
+		IsEnabled: true,
+		Host:      "bastion.example.com",
+		Port:      22,
+		Username:  "tunneluser",
+		AuthType:  sshtunnel.AuthTypePassword,
+		Password:  "tunnelpassword",
+	}
+
+	err := model.Validate()
+
+	assert.ErrorContains(t, err, "SRV")
+}
+
+func Test_Validate_WhenSrvIsEnabledWithoutAnSshTunnel_IsAccepted(t *testing.T) {
+	assert.NoError(t, srvDatabase().Validate())
 }

@@ -28,6 +28,10 @@ const (
 	// hang the boot.
 	startupCleanupTimeout = 5 * time.Second
 
+	// The backup has already finished either way, so the second attempt at dropping
+	// the slot must not hold its result hostage to an unreachable source.
+	slotDropRetryTimeout = 10 * time.Second
+
 	// startupCleanupConcurrency bounds parallel cleanup. With 100+ DBs
 	// configured, unbounded fan-out would saturate Databasus's connection
 	// pool. 10 keeps total boot delay near the slowest 10% of sources.
@@ -62,22 +66,33 @@ func WithBackupSlot(
 		return fmt.Errorf("pre-create drop of backup slot %q: %w", slotName, err)
 	}
 
-	if _, err := conn.Exec(ctx,
+	if _, err := conn.Exec(
+		ctx,
 		"SELECT pg_create_physical_replication_slot($1, true)",
 		slotName,
 	); err != nil {
 		return fmt.Errorf("create backup slot %q: %w", slotName, err)
 	}
 
-	logger.Debug("per-backup slot created", "slot_name", slotName)
+	logger.InfoContext(ctx, "per-backup replication slot created", "slot_name", slotName)
 
 	defer func() {
 		// Background context so defer runs even when ctx is cancelled.
-		if dropErr := dropBackupSlotIfExists(context.Background(), conn, slotName); dropErr != nil {
-			logger.Warn(
+		if dropErr := dropBackupSlotIfExists(context.Background(), conn, slotName); dropErr == nil {
+			logger.InfoContext(ctx, "per-backup replication slot dropped", "slot_name", slotName)
+
+			return
+		}
+
+		// The held connection is the first casualty of a network break, and a bastion in front of the
+		// source makes those routine. Leaving the slot pins WAL on the source until the next backup
+		// runs, which on a weekly full is a week of retained segments.
+		if retryErr := dropBackupSlotOverFreshConn(sourceDB, encryptor, slotName); retryErr != nil {
+			logger.WarnContext(
+				ctx,
 				"post-backup slot drop failed; will be recovered by next backup or startup cleanup",
 				"slot_name", slotName,
-				"error", dropErr,
+				"error", retryErr,
 			)
 		}
 	}()
@@ -85,8 +100,26 @@ func WithBackupSlot(
 	return fn()
 }
 
+func dropBackupSlotOverFreshConn(
+	sourceDB *postgresql_physical.PostgresqlPhysicalDatabase,
+	encryptor encryption.FieldEncryptor,
+	slotName string,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), slotDropRetryTimeout)
+	defer cancel()
+
+	conn, err := sourceDB.OpenInspectionConn(ctx, encryptor)
+	if err != nil {
+		return fmt.Errorf("reopen conn to drop backup slot %q: %w", slotName, err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	return dropBackupSlotIfExists(ctx, conn, slotName)
+}
+
 func dropBackupSlotIfExists(ctx context.Context, conn *pgx.Conn, slotName string) error {
-	_, err := conn.Exec(ctx,
+	_, err := conn.Exec(
+		ctx,
 		`SELECT pg_drop_replication_slot(slot_name)
 		   FROM pg_replication_slots WHERE slot_name = $1`,
 		slotName,
@@ -163,7 +196,21 @@ func RunStartupCleanup(
 			cleanupCtx, cancel := context.WithTimeout(ctx, startupCleanupTimeout)
 			defer cancel()
 
-			conn, err := d.OpenInspectionConn(cleanupCtx, encryptor)
+			// A bastioned source has to fit its SSH handshake into the same budget. Missing it is a
+			// skip, not a leak: WithBackupSlot drops any survivor before it creates the next one.
+			tunneledDatabase, err := postgresql_physical.OpenTunnel(cleanupCtx, postgresql_physical.OpenTunnelSpec{
+				Database:  d,
+				Logger:    scopedLogger,
+				Encryptor: encryptor,
+			})
+			if err != nil {
+				scopedLogger.Warn("startup slot cleanup: skip unreachable bastion", "error", err)
+				skippedCount.Store(databaseID, struct{}{})
+				return
+			}
+			defer tunneledDatabase.Close()
+
+			conn, err := tunneledDatabase.GetDatabaseThroughTunnel().OpenInspectionConn(cleanupCtx, encryptor)
 			if err != nil {
 				scopedLogger.Warn("startup slot cleanup: skip unreachable source", "error", err)
 				skippedCount.Store(databaseID, struct{}{})
@@ -188,7 +235,7 @@ func RunStartupCleanup(
 	skippedCount.Range(func(_, _ any) bool { skipped++; return true })
 	failureCount.Range(func(_, _ any) bool { failed++; return true })
 
-	logger.Info(fmt.Sprintf(
+	logger.InfoContext(ctx, fmt.Sprintf(
 		"startup physical backup slot cleanup complete: %d dropped, %d skipped (unreachable), %d failed",
 		dropped, skipped, failed,
 	))

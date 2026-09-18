@@ -11,8 +11,10 @@ import (
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	postgresql_shared "databasus-backend/internal/features/databases/databases/postgresql/shared"
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/testing/containers"
 	"databasus-backend/internal/util/tools"
 )
@@ -58,6 +60,12 @@ func Test_TestConnection_PasswordContainingSpaces_TestedSuccessfully(t *testing.
 
 	_, err = container.DB.Exec(fmt.Sprintf(
 		`GRANT SELECT ON ALL TABLES IN SCHEMA public TO "%s"`,
+		usernameWithSpaces,
+	))
+	assert.NoError(t, err)
+
+	_, err = container.DB.Exec(fmt.Sprintf(
+		`GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "%s"`,
 		usernameWithSpaces,
 	))
 	assert.NoError(t, err)
@@ -156,8 +164,8 @@ func Test_PostgresqlModel_AcrossSupportedVersions(t *testing.T) {
 				testConnectionSufficientPermissions(t, endpoint, dbVersion.tag)
 			})
 
-			t.Run("Test_IsUserReadOnly_AdminUser_ReturnsFalse", func(t *testing.T) {
-				testIsUserReadOnlyAdminUser(t, endpoint, dbVersion.tag)
+			t.Run("Test_ShouldSuggestReadOnlyUser_AdminUser_ReturnsTrue", func(t *testing.T) {
+				testShouldSuggestReadOnlyUserAdminUser(t, endpoint, dbVersion.tag)
 			})
 
 			t.Run("Test_CreateReadOnlyUser_UserCanReadButNotWrite", func(t *testing.T) {
@@ -174,6 +182,72 @@ func Test_PostgresqlModel_AcrossSupportedVersions(t *testing.T) {
 
 			t.Run("Test_CreateReadOnlyUser_PublicSchemaExistsButNoPermissions_ReturnsError", func(t *testing.T) {
 				testCreateReadOnlyUserPublicSchemaExistsButNoPermissions(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_ShouldSuggestReadOnlyUser_WhenRlsTableInScope_DoesNotSuggest", func(t *testing.T) {
+				testShouldSuggestReadOnlyUserWhenRlsTableInScope(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_ShouldSuggestReadOnlyUser_WhenRlsTableOutsideIncludeSchemas_Suggests", func(t *testing.T) {
+				testShouldSuggestReadOnlyUserWhenRlsTableOutsideIncludeSchemas(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_CreateReadOnlyUser_WhenRlsTableInScope_ReturnsErrorAndCreatesNoRole", func(t *testing.T) {
+				testCreateReadOnlyUserWhenRlsTableInScope(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run(
+				"Test_TestConnection_WhenSelectIsMissingOnSomeTables_ReturnsErrorNamingOnlyUnreadableTable",
+				func(t *testing.T) {
+					testConnectionSelectMissingOnSomeTables(t, endpoint, dbVersion.tag)
+				},
+			)
+
+			t.Run("Test_TestConnection_WhenEveryTableAndSequenceIsReadable_Success", func(t *testing.T) {
+				testConnectionEveryTableAndSequenceReadable(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenSelectIsMissingOnSequence_ReturnsError", func(t *testing.T) {
+				testConnectionSelectMissingOnSequence(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenUnreadableTableIsExcluded_Success", func(t *testing.T) {
+				testConnectionUnreadableTableExcluded(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run(
+				"Test_TestConnection_WhenExcludedEntryIsUnnormalized_Success",
+				func(t *testing.T) {
+					testConnectionUnreadableTableExcludedWithUnnormalizedEntry(
+						t,
+						endpoint,
+						dbVersion.tag,
+					)
+				},
+			)
+
+			t.Run("Test_TestConnection_WhenUnreadableTableIsOutsideIncludedSchemas_Success", func(t *testing.T) {
+				testConnectionUnreadableTableOutsideIncludedSchemas(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenSchemaUsageIsMissing_ReturnsError", func(t *testing.T) {
+				testConnectionSchemaUsageMissing(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenRoleOwnsEveryTable_Success", func(t *testing.T) {
+				testConnectionRoleOwnsEveryTable(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenNoRelationIsInScope_Success", func(t *testing.T) {
+				testConnectionNoRelationInScope(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenPartitionIsUnreadable_ReturnsError", func(t *testing.T) {
+				testConnectionPartitionUnreadable(t, endpoint, dbVersion.tag)
+			})
+
+			t.Run("Test_TestConnection_WhenUnreadableTableBelongsToExtension_Success", func(t *testing.T) {
+				testConnectionUnreadableTableBelongsToExtension(t, endpoint, dbVersion.tag)
 			})
 
 			t.Run("Test_TestConnection_WhenUserMappingUnreadableAndFlagFalse_ReturnsError", func(t *testing.T) {
@@ -199,11 +273,14 @@ func setupUnreadableUserMappingModel(
 	limitedUsername := fmt.Sprintf("um_limited_%s", suffix)
 	limitedPassword := "limitedpassword123"
 	serverName := fmt.Sprintf("um_test_srv_%s", suffix)
-	tableName := fmt.Sprintf("um_test_table_%s", suffix)
+	// The version's subtests share one server (ADR-0013), so an own schema keeps the dump scope
+	// free of the tables other subtests leave behind in public.
+	schemaName := fmt.Sprintf("um_test_schema_%s", suffix)
 
 	setupStatements := []string{
-		fmt.Sprintf(`CREATE TABLE %s (id SERIAL PRIMARY KEY, data TEXT NOT NULL)`, tableName),
-		fmt.Sprintf(`INSERT INTO %s (data) VALUES ('row1')`, tableName),
+		fmt.Sprintf(`CREATE SCHEMA %s`, schemaName),
+		fmt.Sprintf(`CREATE TABLE %s.um_test_table (id SERIAL PRIMARY KEY, data TEXT NOT NULL)`, schemaName),
+		fmt.Sprintf(`INSERT INTO %s.um_test_table (data) VALUES ('row1')`, schemaName),
 		`CREATE EXTENSION IF NOT EXISTS postgres_fdw`,
 		fmt.Sprintf(
 			`CREATE SERVER %s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host 'localhost', dbname 'postgres')`,
@@ -215,8 +292,9 @@ func setupUnreadableUserMappingModel(
 		),
 		fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '%s' LOGIN`, limitedUsername, limitedPassword),
 		fmt.Sprintf(`GRANT CONNECT ON DATABASE "%s" TO "%s"`, container.Database, limitedUsername),
-		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO "%s"`, limitedUsername),
-		fmt.Sprintf(`GRANT SELECT ON %s TO "%s"`, tableName, limitedUsername),
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA %s TO "%s"`, schemaName, limitedUsername),
+		fmt.Sprintf(`GRANT SELECT ON ALL TABLES IN SCHEMA %s TO "%s"`, schemaName, limitedUsername),
+		fmt.Sprintf(`GRANT SELECT ON ALL SEQUENCES IN SCHEMA %s TO "%s"`, schemaName, limitedUsername),
 	}
 
 	for _, statement := range setupStatements {
@@ -226,20 +304,21 @@ func setupUnreadableUserMappingModel(
 
 	t.Cleanup(func() {
 		_, _ = container.DB.Exec(fmt.Sprintf(`DROP SERVER IF EXISTS %s CASCADE`, serverName))
-		_, _ = container.DB.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE`, tableName))
+		_, _ = container.DB.Exec(fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, schemaName))
 		_, _ = container.DB.Exec(fmt.Sprintf(`DROP OWNED BY "%s"`, limitedUsername))
 		_, _ = container.DB.Exec(fmt.Sprintf(`DROP USER IF EXISTS "%s"`, limitedUsername))
 	})
 
 	return &PostgresqlLogicalDatabase{
-		Version:  tools.GetPostgresqlVersionEnum(version),
-		Host:     container.Host,
-		Port:     container.Port,
-		Username: limitedUsername,
-		Password: limitedPassword,
-		Database: &container.Database,
-		SslMode:  postgresql_shared.PostgresSslModeDisable,
-		CpuCount: 1,
+		Version:        tools.GetPostgresqlVersionEnum(version),
+		Host:           container.Host,
+		Port:           container.Port,
+		Username:       limitedUsername,
+		Password:       limitedPassword,
+		Database:       &container.Database,
+		SslMode:        postgresql_shared.PostgresSslModeDisable,
+		IncludeSchemas: []string{schemaName},
+		CpuCount:       1,
 	}
 }
 
@@ -370,6 +449,12 @@ func testConnectionSufficientPermissions(t *testing.T, endpoint containers.Endpo
 	))
 	assert.NoError(t, err)
 
+	_, err = container.DB.Exec(fmt.Sprintf(
+		`GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "%s"`,
+		backupUsername,
+	))
+	assert.NoError(t, err)
+
 	defer func() {
 		_, _ = container.DB.Exec(fmt.Sprintf(`DROP USER IF EXISTS "%s"`, backupUsername))
 	}()
@@ -391,7 +476,7 @@ func testConnectionSufficientPermissions(t *testing.T, endpoint containers.Endpo
 	assert.NoError(t, err)
 }
 
-func testIsUserReadOnlyAdminUser(t *testing.T, endpoint containers.Endpoint, version string) {
+func testShouldSuggestReadOnlyUserAdminUser(t *testing.T, endpoint containers.Endpoint, version string) {
 	container := connectToPostgresEndpoint(t, endpoint)
 	defer container.DB.Close()
 
@@ -399,13 +484,13 @@ func testIsUserReadOnlyAdminUser(t *testing.T, endpoint containers.Endpoint, ver
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	ctx := t.Context()
 
-	isReadOnly, privileges, err := pgModel.IsUserReadOnly(ctx, logger, nil)
+	shouldSuggestReadOnlyUser, privileges, err := pgModel.ShouldSuggestReadOnlyUser(ctx, logger, nil)
 	assert.NoError(t, err)
-	assert.False(t, isReadOnly, "Admin user should not be read-only")
+	assert.True(t, shouldSuggestReadOnlyUser, "Admin user must be offered a read-only user")
 	assert.NotEmpty(t, privileges, "Admin user should have privileges")
 }
 
-func Test_IsUserReadOnly_ReadOnlyUser_ReturnsTrue(t *testing.T) {
+func Test_ShouldSuggestReadOnlyUser_ReadOnlyUser_ReturnsFalse(t *testing.T) {
 	container := connectToPostgresContainer(t, "postgres:16")
 	defer container.DB.Close()
 
@@ -437,9 +522,9 @@ func Test_IsUserReadOnly_ReadOnlyUser_ReturnsTrue(t *testing.T) {
 		CpuCount: 1,
 	}
 
-	isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(ctx, logger, nil)
+	shouldSuggestReadOnlyUser, privileges, err := readOnlyModel.ShouldSuggestReadOnlyUser(ctx, logger, nil)
 	assert.NoError(t, err)
-	assert.True(t, isReadOnly, "Read-only user should be read-only")
+	assert.False(t, shouldSuggestReadOnlyUser, "Read-only user must not be offered another one")
 	assert.Empty(t, privileges, "Read-only user should have no write privileges")
 
 	_, err = container.DB.Exec(fmt.Sprintf(`DROP OWNED BY "%s" CASCADE`, username))
@@ -486,13 +571,13 @@ func testCreateReadOnlyUserCanReadButNotWrite(t *testing.T, endpoint containers.
 		SslMode:  postgresql_shared.PostgresSslModeDisable,
 	}
 
-	isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(
+	shouldSuggestReadOnlyUser, privileges, err := readOnlyModel.ShouldSuggestReadOnlyUser(
 		ctx,
 		logger,
 		nil,
 	)
 	assert.NoError(t, err)
-	assert.True(t, isReadOnly, "Created user should be read-only")
+	assert.False(t, shouldSuggestReadOnlyUser, "Created user must not be offered another one")
 	assert.Empty(t, privileges, "Read-only user should have no write privileges")
 
 	readOnlyDSN := fmt.Sprintf(
@@ -735,13 +820,13 @@ func testCreateReadOnlyUserWithPublicSchema(t *testing.T, endpoint containers.En
 		SslMode:  postgresql_shared.PostgresSslModeDisable,
 	}
 
-	isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(
+	shouldSuggestReadOnlyUser, privileges, err := readOnlyModel.ShouldSuggestReadOnlyUser(
 		ctx,
 		logger,
 		nil,
 	)
 	assert.NoError(t, err)
-	assert.True(t, isReadOnly, "User should be read-only")
+	assert.False(t, shouldSuggestReadOnlyUser, "User must not be offered a read-only user")
 	assert.Empty(t, privileges, "Read-only user should have no write privileges")
 
 	readOnlyDSN := fmt.Sprintf(
@@ -822,13 +907,13 @@ func testCreateReadOnlyUserWithoutPublicSchema(t *testing.T, endpoint containers
 		SslMode:  postgresql_shared.PostgresSslModeDisable,
 	}
 
-	isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(
+	shouldSuggestReadOnlyUser, privileges, err := readOnlyModel.ShouldSuggestReadOnlyUser(
 		ctx,
 		logger,
 		nil,
 	)
 	assert.NoError(t, err)
-	assert.True(t, isReadOnly, "User should be read-only")
+	assert.False(t, shouldSuggestReadOnlyUser, "User must not be offered a read-only user")
 	assert.Empty(t, privileges, "Read-only user should have no write privileges")
 
 	readOnlyDSN := fmt.Sprintf(
@@ -1066,6 +1151,12 @@ func Test_Validate_WhenLocalhostAndDatabasus_ReturnsError(t *testing.T) {
 			username: "postgres",
 			database: "databasus",
 		},
+		{
+			name:     "Unix socket with databasus db",
+			host:     "/tmp",
+			username: "postgres",
+			database: "databasus",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1080,7 +1171,7 @@ func Test_Validate_WhenLocalhostAndDatabasus_ReturnsError(t *testing.T) {
 			}
 
 			err := pgModel.Validate()
-			assert.Error(t, err)
+			require.Error(t, err)
 			assert.Contains(t, err.Error(), "backing up Databasus internal database is not allowed")
 			assert.Contains(t, err.Error(), "https://databasus.com/faq#backup-databasus")
 		})
@@ -2152,4 +2243,164 @@ func extractPostgresVersion(versionStr string) tools.PostgresqlVersion {
 	}
 
 	return tools.GetPostgresqlVersionEnum("16")
+}
+
+func databasusOnLoopback() *PostgresqlLogicalDatabase {
+	databaseName := "databasus"
+
+	return &PostgresqlLogicalDatabase{
+		Host:     "127.0.0.1",
+		Port:     5432,
+		Username: "postgres",
+		Password: "password",
+		Database: &databaseName,
+		CpuCount: 1,
+	}
+}
+
+func Test_Validate_WhenPointedAtDatabasusOnLoopback_IsRejected(t *testing.T) {
+	assert.Error(t, databasusOnLoopback().Validate())
+}
+
+func Test_Validate_WhenDatabasusOnLoopbackIsBehindARemoteBastion_IsAllowed(t *testing.T) {
+	database := databasusOnLoopback()
+	database.SshTunnel = sshtunnel.Config{
+		IsEnabled: true,
+		Host:      "bastion.example.com",
+		Port:      22,
+		Username:  "tunneluser",
+		AuthType:  sshtunnel.AuthTypePassword,
+		Password:  "tunnelpassword",
+	}
+
+	assert.NoError(t, database.Validate())
+}
+
+// A bastion on this machine forwards straight back to the instance the guard protects, so enabling
+// a tunnel must not be a way around it.
+func Test_Validate_WhenDatabasusOnLoopbackIsBehindALocalBastion_IsRejected(t *testing.T) {
+	for _, bastionHost := range []string{"127.0.0.1", "localhost", "host.docker.internal", "127.5.5.5"} {
+		database := databasusOnLoopback()
+		database.SshTunnel = sshtunnel.Config{
+			IsEnabled: true,
+			Host:      bastionHost,
+			Port:      22,
+			Username:  "tunneluser",
+			AuthType:  sshtunnel.AuthTypePassword,
+			Password:  "tunnelpassword",
+		}
+
+		assert.Error(t, database.Validate(), "bastion host %q must not bypass the guard", bastionHost)
+	}
+}
+
+func createRlsTable(t *testing.T, container *PostgresContainer, schema, table string) {
+	t.Helper()
+
+	if schema != "public" {
+		_, err := container.DB.Exec(fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %q`, schema))
+		require.NoError(t, err)
+	}
+
+	_, err := container.DB.Exec(fmt.Sprintf(`CREATE TABLE %q.%q (id int)`, schema, table))
+	require.NoError(t, err)
+
+	_, err = container.DB.Exec(fmt.Sprintf(`ALTER TABLE %q.%q ENABLE ROW LEVEL SECURITY`, schema, table))
+	require.NoError(t, err)
+
+	// The container is shared by every subtest of this version, so a leaked RLS table would
+	// silently flip the verdict for all of them.
+	t.Cleanup(func() {
+		if _, cleanupErr := container.DB.Exec(
+			fmt.Sprintf(`DROP TABLE IF EXISTS %q.%q CASCADE`, schema, table),
+		); cleanupErr != nil {
+			t.Logf("failed to drop row-level security table: %v", cleanupErr)
+		}
+		if schema != "public" {
+			if _, cleanupErr := container.DB.Exec(
+				fmt.Sprintf(`DROP SCHEMA IF EXISTS %q CASCADE`, schema),
+			); cleanupErr != nil {
+				t.Logf("failed to drop row-level security schema: %v", cleanupErr)
+			}
+		}
+	})
+}
+
+func testShouldSuggestReadOnlyUserWhenRlsTableInScope(
+	t *testing.T,
+	endpoint containers.Endpoint,
+	version string,
+) {
+	container := connectToPostgresEndpoint(t, endpoint)
+	t.Cleanup(func() {
+		if closeErr := container.DB.Close(); closeErr != nil {
+			t.Logf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	createRlsTable(t, container, "public", "rls_in_scope")
+
+	pgModel := createPostgresModel(container)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	shouldSuggestReadOnlyUser, privileges, err := pgModel.ShouldSuggestReadOnlyUser(t.Context(), logger, nil)
+	require.NoError(t, err)
+	assert.False(t, shouldSuggestReadOnlyUser, "row-level security must suppress the suggestion")
+	assert.NotEmpty(t, privileges, "the admin user is still privileged, only the suggestion is suppressed")
+}
+
+func testShouldSuggestReadOnlyUserWhenRlsTableOutsideIncludeSchemas(
+	t *testing.T,
+	endpoint containers.Endpoint,
+	version string,
+) {
+	container := connectToPostgresEndpoint(t, endpoint)
+	t.Cleanup(func() {
+		if closeErr := container.DB.Close(); closeErr != nil {
+			t.Logf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	createRlsTable(t, container, "rls_excluded_schema", "rls_out_of_scope")
+
+	pgModel := createPostgresModel(container)
+	pgModel.IncludeSchemas = []string{"public"}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	shouldSuggestReadOnlyUser, _, err := pgModel.ShouldSuggestReadOnlyUser(t.Context(), logger, nil)
+	require.NoError(t, err)
+	assert.True(t, shouldSuggestReadOnlyUser, "row-level security outside the backed-up schemas is irrelevant")
+}
+
+func testCreateReadOnlyUserWhenRlsTableInScope(
+	t *testing.T,
+	endpoint containers.Endpoint,
+	version string,
+) {
+	container := connectToPostgresEndpoint(t, endpoint)
+	t.Cleanup(func() {
+		if closeErr := container.DB.Close(); closeErr != nil {
+			t.Logf("failed to close connection: %v", closeErr)
+		}
+	})
+
+	createRlsTable(t, container, "public", "rls_blocks_creation")
+
+	pgModel := createPostgresModel(container)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	const countDatabasusRolesQuery = `SELECT COUNT(*) FROM pg_roles WHERE rolname LIKE 'databasus-%'`
+
+	var roleCountBeforeRefusal int
+	require.NoError(t, container.DB.Get(&roleCountBeforeRefusal, countDatabasusRolesQuery))
+
+	createdUsername, createdPassword, err := pgModel.CreateReadOnlyUser(t.Context(), logger, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "public.rls_blocks_creation")
+	assert.Empty(t, createdUsername)
+	assert.Empty(t, createdPassword)
+
+	var roleCountAfterRefusal int
+	require.NoError(t, container.DB.Get(&roleCountAfterRefusal, countDatabasusRolesQuery))
+	assert.Equal(t, roleCountBeforeRefusal, roleCountAfterRefusal, "refusal must not leave a role behind")
 }

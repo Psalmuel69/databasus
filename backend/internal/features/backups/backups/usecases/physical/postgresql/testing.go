@@ -27,6 +27,7 @@ import (
 	"databasus-backend/internal/features/intervals"
 	"databasus-backend/internal/features/notifiers"
 	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	users_dto "databasus-backend/internal/features/users/dto"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
@@ -36,6 +37,8 @@ import (
 	"databasus-backend/internal/storage"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/logger"
+	"databasus-backend/internal/util/testing/bastion"
+	"databasus-backend/internal/util/testing/containers"
 	"databasus-backend/internal/util/walmath"
 )
 
@@ -170,6 +173,33 @@ func SetupPhysicalDBForScheduledBackupVersion(
 	})
 }
 
+func SetupPhysicalDBFixtureWithTunnel(
+	t *testing.T,
+	spec databases.PhysicalTestDatabaseSpec,
+) *PhysicalDBFixture {
+	t.Helper()
+
+	return wirePhysicalDBFixture(t, func(workspaceID uuid.UUID, notifier *notifiers.Notifier) *databases.Database {
+		return databases.CreateTestPhysicalPostgresDatabaseWithTunnel(spec, workspaceID, notifier)
+	})
+}
+
+// The source publishes no port, so every connection a test on this fixture makes has to go through
+// the bastion — a direct route would keep it green after the tunnel stopped being used.
+func SetupPhysicalDBForBackupBehindSshBastion(t *testing.T) *PhysicalDBFixture {
+	t.Helper()
+
+	topology := containers.StartPhysicalPostgresBehindSshBastion(t, "postgres:17")
+
+	return SetupPhysicalDBFixtureWithTunnel(t, databases.PhysicalTestDatabaseSpec{
+		Host:       topology.Database.Host,
+		Port:       topology.Database.Port,
+		VersionTag: "17",
+		BackupType: postgresql_physical.BackupTypeFullIncrementalAndWalStream,
+		SshTunnel:  bastion.GetTunnelConfig(topology),
+	})
+}
+
 // wirePhysicalDBFixture provisions the scaffolding every physical fixture needs —
 // workspace, storage, notifier, the source DB (via createDB), populated data, and
 // the persisted system_identifier — returning it with backups still disabled and
@@ -188,24 +218,35 @@ func wirePhysicalDBFixture(
 		backups_config_logical.GetBackupConfigController(),
 	)
 
-	owner := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	owner := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 
-	workspace := workspaces_testing.CreateTestWorkspace("ws "+uuid.New().String(), owner, router)
-	t.Cleanup(func() { workspaces_testing.RemoveTestWorkspace(workspace, router) })
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "ws "+uuid.New().String(), owner, router)
+	t.Cleanup(func() { workspaces_testing.RemoveTestWorkspace(context.Background(), workspace, router) })
 
 	testStorage := storages.CreateTestStorage(workspace.ID)
-	t.Cleanup(func() { storages.RemoveTestStorage(testStorage.ID) })
+	t.Cleanup(func() { storages.RemoveTestStorage(t.Context(), testStorage.ID) })
 
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	t.Cleanup(func() { notifiers.RemoveTestNotifier(notifier) })
 
 	db := createDB(workspace.ID, notifier)
-	t.Cleanup(func() { databases.RemoveTestDatabase(db) })
+	t.Cleanup(func() { databases.RemoveTestDatabase(t.Context(), db) })
 
 	encryptor := encryption.GetFieldEncryptor()
 	log := logger.GetLogger()
 
-	require.NoError(t, db.PostgresqlPhysical.PopulateDbData(log, encryptor))
+	// Through the tunnel, exactly as the database service does it, so a bastioned fixture reaches its
+	// source and the discovered identity is carried back onto the row that gets persisted below.
+	tunneledDatabase, err := postgresql_physical.OpenTunnel(t.Context(), postgresql_physical.OpenTunnelSpec{
+		Database:  db.PostgresqlPhysical,
+		Logger:    log,
+		Encryptor: encryptor,
+	})
+	require.NoError(t, err)
+	t.Cleanup(tunneledDatabase.Close)
+
+	require.NoError(t, tunneledDatabase.GetDatabaseThroughTunnel().PopulateDbData(log, encryptor))
+	tunneledDatabase.CopyDiscoveredMetadataToOriginal()
 
 	// CreateTestPhysicalPostgresDatabase saved the row before PopulateDbData ran,
 	// so the captured system_identifier lives only on the in-memory object. The
@@ -251,7 +292,7 @@ func setupPhysicalFixture(
 		TimeOfDay: new("04:00"),
 	}
 
-	_, err = cfgService.SaveBackupConfig(cfg)
+	_, err = cfgService.SaveBackupConfig(t.Context(), cfg)
 	require.NoError(t, err)
 
 	backupID := uuid.New()
@@ -287,12 +328,25 @@ func setupPhysicalFixture(
 	return fixture
 }
 
-// OpenAdminConn returns an inspection connection to the source PG with
-// automatic close on test cleanup.
+// Through the production opener rather than a hand-rolled dial: a bastioned source publishes no
+// port, so a test that reached it any other way would stay green after the tunnel stopped being
+// used. With no tunnel configured OpenTunnel hands back the original, so direct fixtures are
+// unaffected.
 func OpenAdminConn(t *testing.T, fixture *PhysicalDBFixture) *pgx.Conn {
 	t.Helper()
 
-	conn, err := fixture.DB.PostgresqlPhysical.OpenInspectionConn(context.Background(), encryption.GetFieldEncryptor())
+	encryptor := encryption.GetFieldEncryptor()
+
+	tunneledDatabase, err := postgresql_physical.OpenTunnel(t.Context(), postgresql_physical.OpenTunnelSpec{
+		Database:  fixture.DB.PostgresqlPhysical,
+		Logger:    logger.GetLogger(),
+		Encryptor: encryptor,
+	})
+	require.NoError(t, err)
+	t.Cleanup(tunneledDatabase.Close)
+
+	conn, err := tunneledDatabase.GetDatabaseThroughTunnel().
+		OpenInspectionConn(context.Background(), encryptor)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close(context.Background()) })
 
@@ -384,7 +438,8 @@ func GenerateWalActivity(
 ) (int64, error) {
 	tableName := "wal_activity_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 
-	if _, err := conn.Exec(ctx,
+	if _, err := conn.Exec(
+		ctx,
 		fmt.Sprintf(`CREATE TABLE %s (id BIGSERIAL PRIMARY KEY, payload TEXT)`, tableName),
 	); err != nil {
 		return 0, fmt.Errorf("create wal activity table: %w", err)
@@ -404,7 +459,8 @@ func GenerateWalActivity(
 	const payloadSize = 1024
 
 	for {
-		_, err := conn.Exec(ctx,
+		_, err := conn.Exec(
+			ctx,
 			fmt.Sprintf(
 				`INSERT INTO %s (payload) SELECT repeat('x', %d) FROM generate_series(1, %d)`,
 				tableName, payloadSize, rowsPerBatch,
@@ -563,7 +619,8 @@ func SetSummarizerEnabled(t *testing.T, conn *pgx.Conn, enabled bool) {
 	defer cancel()
 
 	var previous string
-	if err := conn.QueryRow(ctx,
+	if err := conn.QueryRow(
+		ctx,
 		"SELECT setting FROM pg_settings WHERE name = 'summarize_wal'",
 	).Scan(&previous); err != nil {
 		t.Fatalf("read summarize_wal: %v", err)
@@ -578,7 +635,8 @@ func SetSummarizerEnabled(t *testing.T, conn *pgx.Conn, enabled bool) {
 		return
 	}
 
-	if _, err := conn.Exec(ctx,
+	if _, err := conn.Exec(
+		ctx,
 		fmt.Sprintf("ALTER SYSTEM SET summarize_wal = '%s'", desired),
 	); err != nil {
 		t.Fatalf("ALTER SYSTEM summarize_wal=%s: %v", desired, err)
@@ -614,13 +672,15 @@ func ExpireWalSummaries(t *testing.T, conn *pgx.Conn) {
 	defer cancel()
 
 	var previous string
-	if err := conn.QueryRow(ctx,
+	if err := conn.QueryRow(
+		ctx,
 		"SELECT setting FROM pg_settings WHERE name = 'wal_summary_keep_time'",
 	).Scan(&previous); err != nil {
 		t.Fatalf("read wal_summary_keep_time: %v", err)
 	}
 
-	if _, err := conn.Exec(ctx,
+	if _, err := conn.Exec(
+		ctx,
 		"ALTER SYSTEM SET wal_summary_keep_time = '1min'",
 	); err != nil {
 		t.Fatalf("ALTER SYSTEM wal_summary_keep_time: %v", err)
@@ -720,9 +780,38 @@ type WalStreamerForTest struct {
 	Stop       func()
 }
 
+// fixedStorageLocator resolves every storage ID to the one saver a test handed in,
+// so the store writes and deletes exactly where the test can observe it.
+type fixedStorageLocator struct {
+	storage storages.StorageFileSaver
+}
+
+func (l fixedStorageLocator) GetFileWriter(
+	context.Context, uuid.UUID,
+) (storage_files.FileWriter, error) {
+	return l.storage, nil
+}
+
+func (l fixedStorageLocator) GetFileRemover(
+	context.Context, uuid.UUID,
+) (storage_files.FileRemover, error) {
+	return l.storage, nil
+}
+
+func NewTestFileStore(saver storages.StorageFileSaver) *storage_files.Store {
+	return storage_files.NewStore(storage_files.Dependencies{
+		Repository:     &storage_files.PendingDeletionRepository{},
+		Locator:        fixedStorageLocator{storage: saver},
+		FieldEncryptor: encryption.GetFieldEncryptor(),
+		Logger:         logger.GetLogger(),
+		Timings:        storage_files.TimingsForTest(),
+	})
+}
+
 type WalStreamerTestSpec struct {
 	Fixture                   *PhysicalDBFixture
 	Storage                   storages.StorageFileSaver
+	FileStore                 *storage_files.Store
 	WatchDirRoot              string
 	WalLagThresholdBytes      int64
 	ForcedRotationInterval    time.Duration
@@ -746,11 +835,15 @@ func StartWalStreamerForTest(t *testing.T, spec WalStreamerTestSpec) *WalStreame
 		DropReplicationSlotExternally(t, adminConn, fixture.DB.PostgresqlPhysical.ReplicationSlotName)
 	})
 
+	if spec.FileStore == nil {
+		spec.FileStore = NewTestFileStore(spec.Storage)
+	}
+
 	supervisor := NewWalStreamSupervisor(WalStreamSpec{
 		DatabaseID:                fixture.DB.ID,
 		SourceDB:                  fixture.DB.PostgresqlPhysical,
 		StorageID:                 fixture.Storage.ID,
-		Storage:                   spec.Storage,
+		FileStore:                 spec.FileStore,
 		Encryption:                backups_core_enums.BackupEncryptionNone,
 		FieldEncryptor:            encryption.GetFieldEncryptor(),
 		WalSegmentRepo:            physical_repositories.GetWalSegmentRepository(),

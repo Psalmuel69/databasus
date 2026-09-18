@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	postgresql_shared "databasus-backend/internal/features/databases/databases/postgresql/shared"
+	"databasus-backend/internal/features/sshtunnel"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/tools"
 )
@@ -38,6 +38,13 @@ type PostgresqlPhysicalDatabase struct {
 	SslClientCert string                            `json:"sslClientCert" gorm:"column:ssl_client_cert;type:text;not null;default:''"`
 	SslClientKey  string                            `json:"sslClientKey"  gorm:"column:ssl_client_key;type:text;not null;default:''"`
 	SslRootCert   string                            `json:"sslRootCert"   gorm:"column:ssl_root_cert;type:text;not null;default:''"`
+
+	// When the tunnel is enabled, Host and Port above address the cluster as the bastion sees it.
+	SshTunnel sshtunnel.Config `json:"sshTunnel" gorm:"embedded;embeddedPrefix:ssh_"`
+
+	// Set only on the copy handed out by OpenTunnel, so CredentialSpec can point libpq at the
+	// forwarded port while Host keeps the name that TLS and .pgpass are matched against.
+	LocalTunnelEndpoint *sshtunnel.Endpoint `json:"-" gorm:"-"`
 
 	ReplicationSlotName string  `json:"-"                gorm:"column:replication_slot_name;type:text;not null"`
 	SystemIdentifier    *string `json:"systemIdentifier" gorm:"column:system_identifier;type:text"`
@@ -80,6 +87,14 @@ func (p *PostgresqlPhysicalDatabase) Validate() error {
 		return err
 	}
 
+	if err := p.SshTunnel.Validate(); err != nil {
+		return err
+	}
+
+	if err := p.ValidateNotEmbeddedTarget(); err != nil {
+		return err
+	}
+
 	switch p.BackupType {
 	case BackupTypeFullOnly, BackupTypeFullAndIncremental, BackupTypeFullIncrementalAndWalStream:
 	case "":
@@ -89,6 +104,16 @@ func (p *PostgresqlPhysicalDatabase) Validate() error {
 	}
 
 	return nil
+}
+
+func (p *PostgresqlPhysicalDatabase) ValidateNotEmbeddedTarget() error {
+	return postgresql_shared.ValidateNotEmbeddedTarget(postgresql_shared.EmbeddedTargetSpec{
+		Host:               p.Host,
+		Port:               p.Port,
+		IsPhysical:         true,
+		IsSSHTunnelEnabled: p.SshTunnel.IsEnabled,
+		SSHBastionHost:     p.SshTunnel.Host,
+	})
 }
 
 func (p *PostgresqlPhysicalDatabase) ValidateUpdate(old *PostgresqlPhysicalDatabase) error {
@@ -129,6 +154,7 @@ func (p *PostgresqlPhysicalDatabase) Update(incoming *PostgresqlPhysicalDatabase
 	p.SslClientCert = incoming.SslClientCert
 	p.SslRootCert = incoming.SslRootCert
 	p.BackupType = incoming.BackupType
+	p.SshTunnel.Update(&incoming.SshTunnel)
 
 	if incoming.Password != "" {
 		p.Password = incoming.Password
@@ -148,6 +174,29 @@ func (p *PostgresqlPhysicalDatabase) HideSensitiveData() {
 
 	p.Password = ""
 	p.SslClientKey = ""
+	p.SshTunnel.HideSensitiveData()
+}
+
+// Copying the struct rather than listing fields is the point: a field added later travels with it
+// instead of being silently dropped. The three server-managed fields must not travel: BeforeCreate
+// only mints a replication slot name when the field is empty, so an inherited one would leave two
+// databases sharing a single slot on the source cluster, and the identifier and segment size are
+// read back from whichever cluster the copy is pointed at. LocalTunnelEndpoint belongs to the
+// operation that opened the tunnel, not to the configuration.
+func (p *PostgresqlPhysicalDatabase) CopyForNewDatabase() *PostgresqlPhysicalDatabase {
+	if p == nil {
+		return nil
+	}
+
+	copiedDatabase := *p
+	copiedDatabase.ID = uuid.Nil
+	copiedDatabase.DatabaseID = nil
+	copiedDatabase.ReplicationSlotName = ""
+	copiedDatabase.SystemIdentifier = nil
+	copiedDatabase.WalSegmentSizeBytes = nil
+	copiedDatabase.LocalTunnelEndpoint = nil
+
+	return &copiedDatabase
 }
 
 func (p *PostgresqlPhysicalDatabase) EncryptSensitiveFields(
@@ -171,7 +220,7 @@ func (p *PostgresqlPhysicalDatabase) EncryptSensitiveFields(
 		*field = encrypted
 	}
 
-	return nil
+	return p.SshTunnel.EncryptSensitiveFields(encryptor)
 }
 
 func (p *PostgresqlPhysicalDatabase) PopulateDbData(
@@ -207,7 +256,8 @@ func (p *PostgresqlPhysicalDatabase) PopulateDbData(
 	if p.WalSegmentSizeBytes == nil {
 		var sizeBytes int64
 
-		if err := conn.QueryRow(ctx,
+		if err := conn.QueryRow(
+			ctx,
 			"SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size'",
 		).Scan(&sizeBytes); err != nil {
 			return fmt.Errorf("failed to read wal_segment_size: %w", err)
@@ -284,7 +334,8 @@ func (p *PostgresqlPhysicalDatabase) VerifyWalSlot(
 	defer closeConnQuietly(ctx, conn, logger)
 
 	var slotType string
-	err = conn.QueryRow(ctx,
+	err = conn.QueryRow(
+		ctx,
 		"SELECT slot_type FROM pg_replication_slots WHERE slot_name = $1",
 		p.ReplicationSlotName,
 	).Scan(&slotType)
@@ -298,7 +349,7 @@ func (p *PostgresqlPhysicalDatabase) VerifyWalSlot(
 			)
 		}
 
-		logger.Debug("replication slot already exists", "slot_name", p.ReplicationSlotName)
+		logger.DebugContext(ctx, "replication slot already exists", "slot_name", p.ReplicationSlotName)
 
 		return nil
 
@@ -308,14 +359,15 @@ func (p *PostgresqlPhysicalDatabase) VerifyWalSlot(
 		return fmt.Errorf("query pg_replication_slots: %w", err)
 	}
 
-	_, err = conn.Exec(ctx,
+	_, err = conn.Exec(
+		ctx,
 		"SELECT pg_create_physical_replication_slot($1, true)",
 		p.ReplicationSlotName,
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42710" {
-			logger.Debug("replication slot created by concurrent verify",
+			logger.DebugContext(ctx, "replication slot created by concurrent verify",
 				"slot_name", p.ReplicationSlotName)
 
 			return nil
@@ -324,7 +376,7 @@ func (p *PostgresqlPhysicalDatabase) VerifyWalSlot(
 		return fmt.Errorf("create physical replication slot: %w", err)
 	}
 
-	logger.Info("replication slot created", "slot_name", p.ReplicationSlotName)
+	logger.InfoContext(ctx, "replication slot created", "slot_name", p.ReplicationSlotName)
 
 	return nil
 }
@@ -354,14 +406,15 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlot(
 
 	var slotType string
 	var isActive bool
-	err = conn.QueryRow(ctx,
+	err = conn.QueryRow(
+		ctx,
 		"SELECT slot_type, active FROM pg_replication_slots WHERE slot_name = $1",
 		p.ReplicationSlotName,
 	).Scan(&slotType, &isActive)
 
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		logger.Debug("replication slot already absent", "slot_name", p.ReplicationSlotName)
+		logger.DebugContext(ctx, "replication slot already absent", "slot_name", p.ReplicationSlotName)
 
 		return nil
 
@@ -383,14 +436,15 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlot(
 		)
 	}
 
-	_, err = conn.Exec(ctx,
+	_, err = conn.Exec(
+		ctx,
 		"SELECT pg_drop_replication_slot($1)",
 		p.ReplicationSlotName,
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42704" {
-			logger.Debug("replication slot dropped by concurrent caller",
+			logger.DebugContext(ctx, "replication slot dropped by concurrent caller",
 				"slot_name", p.ReplicationSlotName)
 
 			return nil
@@ -399,7 +453,7 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlot(
 		return fmt.Errorf("drop replication slot: %w", err)
 	}
 
-	logger.Info("replication slot dropped", "slot_name", p.ReplicationSlotName)
+	logger.InfoContext(ctx, "replication slot dropped", "slot_name", p.ReplicationSlotName)
 
 	return nil
 }
@@ -432,14 +486,15 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlotForRemoval(
 		var slotType string
 		var isActive bool
 		var activePID *int
-		err = conn.QueryRow(ctx,
+		err = conn.QueryRow(
+			ctx,
 			"SELECT slot_type, active, active_pid FROM pg_replication_slots WHERE slot_name = $1",
 			p.ReplicationSlotName,
 		).Scan(&slotType, &isActive, &activePID)
 
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
-			logger.Debug("replication slot already absent", "slot_name", p.ReplicationSlotName)
+			logger.DebugContext(ctx, "replication slot already absent", "slot_name", p.ReplicationSlotName)
 
 			return nil
 
@@ -463,7 +518,7 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlotForRemoval(
 		// rather than assume the detach is instantaneous.
 		if activePID != nil {
 			if _, termErr := conn.Exec(ctx, "SELECT pg_terminate_backend($1)", *activePID); termErr != nil {
-				logger.Warn("failed to terminate replication slot consumer",
+				logger.WarnContext(ctx, "failed to terminate replication slot consumer",
 					"slot_name", p.ReplicationSlotName, "active_pid", *activePID, "error", termErr)
 			}
 		}
@@ -479,7 +534,9 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlotForRemoval(
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42704" {
-			logger.Debug("replication slot dropped by concurrent caller", "slot_name", p.ReplicationSlotName)
+			logger.DebugContext(ctx, "replication slot dropped by concurrent caller",
+				"slot_name", p.ReplicationSlotName,
+			)
 
 			return nil
 		}
@@ -487,7 +544,7 @@ func (p *PostgresqlPhysicalDatabase) DropWalSlotForRemoval(
 		return fmt.Errorf("drop replication slot: %w", err)
 	}
 
-	logger.Info("replication slot dropped", "slot_name", p.ReplicationSlotName)
+	logger.InfoContext(ctx, "replication slot dropped", "slot_name", p.ReplicationSlotName)
 
 	return nil
 }
@@ -515,16 +572,10 @@ func (p *PostgresqlPhysicalDatabase) GetClusterSizeMb(
 	return float64(sizeBytes) / (1024 * 1024), nil
 }
 
-// IsUserReplicationOnly reports whether the configured user has only
-// LOGIN + REPLICATION (or its cloud equivalent) and nothing more. Mirrors
-// logical's IsUserReadOnly but tuned for physical: cloud admin roles
-// (rds_superuser, azure_pg_admin, cloudsqlsuperuser) count as "excessive"
-// even though they don't flip rolsuper on managed PG.
-//
-// Returns (isMinimal, excessivePrivileges, error). REPLICATION itself is the
-// baseline and is NOT in the excessive list — it is validated separately by
-// TestReplicationConnection.
-func (p *PostgresqlPhysicalDatabase) IsUserReplicationOnly(
+// Cloud admin roles (rds_superuser, azure_pg_admin, cloudsqlsuperuser) count as excessive even
+// though they don't flip rolsuper on managed PG. REPLICATION itself is the baseline and is not
+// excessive - it is validated separately by TestReplicationConnection.
+func (p *PostgresqlPhysicalDatabase) ShouldSuggestReplicationOnlyUser(
 	ctx context.Context,
 	logger *slog.Logger,
 	encryptor encryption.FieldEncryptor,
@@ -675,27 +726,24 @@ func (p *PostgresqlPhysicalDatabase) IsUserReplicationOnly(
 		excessive = append(excessive, "EXECUTE (SECURITY DEFINER)")
 	}
 
-	return len(excessive) == 0, excessive, nil
+	return len(excessive) > 0, excessive, nil
 }
 
-// CreateReplicationOnlyUser provisions a fresh role with exactly
-// LOGIN + REPLICATION (or its cloud equivalent). Mirrors logical's
-// CreateReadOnlyUser but trivially smaller — physical doesn't need schema /
-// table grants. Cloud-aware: each platform grants replication differently
-// and some (Azure / GCP) require operator action in the console first.
+// Managed platforms grant replication through platform roles and may withhold EXECUTE on
+// pg_switch_wal(), so the two capabilities are negotiated independently.
 func (p *PostgresqlPhysicalDatabase) CreateReplicationOnlyUser(
 	ctx context.Context,
 	logger *slog.Logger,
 	encryptor encryption.FieldEncryptor,
-) (string, string, error) {
+) (*ReplicationOnlyUser, error) {
 	conn, err := openConn(ctx, p, encryptor)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to connect to cluster: %w", err)
+		return nil, fmt.Errorf("failed to connect to cluster: %w", err)
 	}
 	defer closeConnQuietly(ctx, conn, logger)
 
 	if err := assertCanCreateRole(ctx, conn); err != nil {
-		return "", "", err
+		return nil, err
 	}
 
 	platform := detectPlatform(ctx, conn)
@@ -707,14 +755,14 @@ func (p *PostgresqlPhysicalDatabase) CreateReplicationOnlyUser(
 
 		tx, err := conn.Begin(ctx)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to begin transaction: %w", err)
+			return nil, fmt.Errorf("failed to begin transaction: %w", err)
 		}
 
 		isCommitted := false
 		defer func() {
 			if !isCommitted {
 				if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-					logger.Warn("failed to rollback transaction", "error", rollbackErr)
+					logger.WarnContext(ctx, "failed to rollback transaction", "error", rollbackErr)
 				}
 			}
 		}()
@@ -727,11 +775,16 @@ func (p *PostgresqlPhysicalDatabase) CreateReplicationOnlyUser(
 			if strings.Contains(err.Error(), "already exists") && attempt < maxRetries-1 {
 				continue
 			}
-			return "", "", fmt.Errorf("failed to create user: %w", err)
+			return nil, fmt.Errorf("failed to create user: %w", err)
 		}
 
 		if err := grantReplication(ctx, tx, baseUsername, platform); err != nil {
-			return "", "", err
+			return nil, err
+		}
+
+		isWalSwitchGranted, err := grantWalSwitchIfPermitted(ctx, tx, baseUsername)
+		if err != nil {
+			return nil, err
 		}
 
 		var verifyName string
@@ -740,25 +793,39 @@ func (p *PostgresqlPhysicalDatabase) CreateReplicationOnlyUser(
 			`SELECT rolname FROM pg_roles WHERE rolname = $1`,
 			baseUsername,
 		).Scan(&verifyName); err != nil {
-			return "", "", fmt.Errorf("failed to verify user creation: %w", err)
+			return nil, fmt.Errorf("failed to verify user creation: %w", err)
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return "", "", fmt.Errorf("failed to commit transaction: %w", err)
+			return nil, fmt.Errorf("failed to commit transaction: %w", err)
 		}
 		isCommitted = true
 
-		logger.Info("replication-only user created", "username", baseUsername, "platform", platform)
-		return baseUsername, newPassword, nil
+		logger.InfoContext(ctx, "replication-only user created", "username", baseUsername, "platform", platform)
+
+		if !isWalSwitchGranted {
+			logger.WarnContext(
+				ctx,
+				"source refused the pg_switch_wal grant; continuous wal streaming is unavailable for this user",
+				"username",
+				baseUsername,
+				"platform",
+				platform,
+			)
+		}
+
+		return &ReplicationOnlyUser{
+			Username:                     baseUsername,
+			Password:                     newPassword,
+			IsForcedWalRotationAvailable: isWalSwitchGranted,
+		}, nil
 	}
 
-	return "", "", errors.New("failed to generate unique username after 3 attempts")
+	return nil, errors.New("failed to generate unique username after 3 attempts")
 }
 
-// OpenInspectionConn opens a regular (non-replication) connection to the
-// source cluster. Used by the FULL/INCR executors for pre-flight checks
-// (timeline.CheckTimelineCompatibility), .history file reads, and
-// post-stream LSN validation.
+// Replication connections cannot run the SQL identity checks or read timeline
+// history files, so inspection uses PostgreSQL's regular protocol.
 func (p *PostgresqlPhysicalDatabase) OpenInspectionConn(
 	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
@@ -814,6 +881,30 @@ func (p *PostgresqlPhysicalDatabase) checkReplicationReadiness(
 
 	if p.BackupType.IsRequireWalSummary() && settings.summarizeWal != "on" {
 		return &postgresql_shared.ConnectionTestError{Code: postgresql_shared.ConnErrWalSummaryDisabled}
+	}
+
+	// Continuous streaming promises a recovery point between backups, and only a
+	// finalized segment is uploaded. Without pg_switch_wal a quiet source leaves its
+	// newest WAL local until the segment fills, so the promise cannot be kept.
+	if p.BackupType.IsWalStreaming() {
+		canRotate, err := canForceWalRotation(ctx, conn, p.Username)
+		if err != nil {
+			return err
+		}
+
+		if !canRotate {
+			quotedUsername := pgx.Identifier{p.Username}.Sanitize()
+
+			return &postgresql_shared.ConnectionTestError{
+				Code: postgresql_shared.ConnErrNoWalSwitchPrivilege,
+				Message: fmt.Sprintf(
+					"user %s cannot force a WAL segment switch, so the recovery point between backups "+
+						"would advance only as segments fill. Run GRANT EXECUTE ON FUNCTION pg_switch_wal() TO %s "+
+						"on the source, or choose a backup type that does not replay archived WAL",
+					quotedUsername, quotedUsername,
+				),
+			}
+		}
 	}
 
 	if p.SystemIdentifier != nil {
@@ -1042,83 +1133,5 @@ func classifyReplicationConnectError(err error, username string) error {
 		return &postgresql_shared.ConnectionTestError{Code: postgresql_shared.ConnErrNoReplicationPrivilege}
 	default:
 		return &postgresql_shared.ConnectionTestError{Code: postgresql_shared.ConnErrConnectionFailed}
-	}
-}
-
-// openConn opens a regular pgx connection to the `postgres` database (always
-// exists; physical model has no per-DB selection), carrying the source's client
-// certificates the same way pg_basebackup does via the shared credential files.
-func openConn(
-	ctx context.Context,
-	p *PostgresqlPhysicalDatabase,
-	encryptor encryption.FieldEncryptor,
-) (*pgx.Conn, error) {
-	password, err := postgresql_shared.DecryptFieldIfNeeded(p.Password, encryptor)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	files, err := postgresql_shared.WriteCredentialFilesToTempDir(p.CredentialSpec(), password, encryptor)
-	if err != nil {
-		return nil, err
-	}
-	defer files.Remove()
-
-	return pgx.Connect(ctx, postgresql_shared.BuildConnString(p.CredentialSpec(), password, "postgres", files))
-}
-
-// openPhysicalReplicationConn opens a PHYSICAL replication connection (replication=true) — the same
-// mode pg_basebackup / pg_receivewal use. This is what exercises the "host replication" pg_hba path
-// and the REPLICATION privilege at connect time; an ordinary "host all" rule does NOT cover it, so a
-// logical (replication=database) probe would wrongly accept a cluster that real backups cannot stream.
-// Uses the low-level pgconn because no ordinary SQL is allowed on a physical replication connection.
-func openPhysicalReplicationConn(
-	ctx context.Context,
-	p *PostgresqlPhysicalDatabase,
-	encryptor encryption.FieldEncryptor,
-) (*pgconn.PgConn, error) {
-	password, err := postgresql_shared.DecryptFieldIfNeeded(p.Password, encryptor)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	files, err := postgresql_shared.WriteCredentialFilesToTempDir(p.CredentialSpec(), password, encryptor)
-	if err != nil {
-		return nil, err
-	}
-	defer files.Remove()
-
-	return pgconn.Connect(
-		ctx,
-		postgresql_shared.BuildPhysicalReplicationConnString(p.CredentialSpec(), password, "postgres", files),
-	)
-}
-
-func closeConnQuietly(ctx context.Context, conn *pgx.Conn, logger *slog.Logger) {
-	if err := conn.Close(ctx); err != nil {
-		logger.Warn("failed to close connection", "error", err)
-	}
-}
-
-var versionRegexp = regexp.MustCompile(`PostgreSQL (\d+)`)
-
-func detectVersion(ctx context.Context, conn *pgx.Conn) (tools.PostgresqlVersion, error) {
-	var versionStr string
-	if err := conn.QueryRow(ctx, "SELECT version()").Scan(&versionStr); err != nil {
-		return "", fmt.Errorf("failed to query version(): %w", err)
-	}
-
-	matches := versionRegexp.FindStringSubmatch(versionStr)
-	if len(matches) < 2 {
-		return "", fmt.Errorf("could not parse version from: %s", versionStr)
-	}
-
-	switch matches[1] {
-	case "17":
-		return tools.PostgresqlVersion17, nil
-	case "18":
-		return tools.PostgresqlVersion18, nil
-	default:
-		return "", fmt.Errorf("physical backup requires PostgreSQL 17 or 18, detected %s", matches[1])
 	}
 }

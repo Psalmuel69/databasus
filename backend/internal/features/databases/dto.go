@@ -5,7 +5,13 @@ type CreateReadOnlyUserResponse struct {
 	Password string `json:"password"`
 }
 
-type IsReadOnlyResponse struct {
-	IsReadOnly bool     `json:"isReadOnly"`
-	Privileges []string `json:"privileges"`
+type ShouldSuggestReadOnlyUserResponse struct {
+	ShouldSuggestReadOnlyUser bool     `json:"shouldSuggestReadOnlyUser"`
+	Privileges                []string `json:"privileges"`
+}
+
+type CreateReplicationOnlyUserResponse struct {
+	Username                     string `json:"username"`
+	Password                     string `json:"password"`
+	IsForcedWalRotationAvailable bool   `json:"isForcedWalRotationAvailable"`
 }

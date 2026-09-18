@@ -25,7 +25,7 @@ func createSupervisorWithStagedSegment(
 		DatabaseID:     fixture.DB.ID,
 		SourceDB:       fixture.DB.PostgresqlPhysical,
 		StorageID:      fixture.Storage.ID,
-		Storage:        store,
+		FileStore:      newMockWalStoreFor(store),
 		Encryption:     backups_core_enums.BackupEncryptionNone,
 		FieldEncryptor: encryption.GetFieldEncryptor(),
 		WalSegmentRepo: physical_repositories.GetWalSegmentRepository(),
@@ -48,7 +48,7 @@ func Test_SweepPendingUploads_WhenUploadSucceeds_RemovesSegmentFromStagingDir(t 
 
 	supervisor.sweepPendingUploads(t.Context(), logger.GetLogger(), supervisor.uploader.ProcessSegment)
 
-	require.True(t, store.hasObject(walSegmentObjectName(fixture.DB.ID, 1, walName(1, 70))),
+	require.True(t, store.hasObjectFor(fixture.DB.ID, 1, walName(1, 70)),
 		"a segment staged out of the resume path is valid WAL of the older chain and must still reach storage")
 	require.NoFileExists(t, stagedSegmentPath, "an uploaded segment must not keep occupying the local queue")
 }
@@ -68,6 +68,6 @@ func Test_SweepPendingUploads_WhenUploadFails_RetainsSegmentForNextTick(t *testi
 	store.stopFailingSaves()
 	supervisor.sweepPendingUploads(t.Context(), logger.GetLogger(), supervisor.uploader.ProcessSegment)
 
-	require.True(t, store.hasObject(walSegmentObjectName(fixture.DB.ID, 1, walName(1, 71))))
+	require.True(t, store.hasObjectFor(fixture.DB.ID, 1, walName(1, 71)))
 	require.NoFileExists(t, stagedSegmentPath)
 }

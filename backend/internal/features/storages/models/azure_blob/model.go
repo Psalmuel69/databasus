@@ -16,10 +16,12 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/google/uuid"
 
 	"databasus-backend/internal/util/encryption"
+	io_utils "databasus-backend/internal/util/io"
 )
 
 const (
@@ -80,8 +82,16 @@ func (s *AzureBlobStorage) SaveFile(
 
 	client, err := s.getClient(encryptor)
 	if err != nil {
+		logger.ErrorContext(ctx, "failed to build the azure blob client",
+			"container", s.ContainerName, "error", err)
+
 		return err
 	}
+
+	startedAt := time.Now().UTC()
+
+	logger.DebugContext(ctx, "saving file to azure blob storage",
+		"file_name", fileName, "container", s.ContainerName)
 
 	blobName := s.buildBlobName(fileName)
 	blockBlobClient := client.ServiceClient().
@@ -143,21 +153,35 @@ func (s *AzureBlobStorage) SaveFile(
 			nil,
 		)
 		if err != nil {
+			logger.ErrorContext(ctx, "failed to save empty file to azure blob storage",
+				"file_name", fileName, "error", err)
+
 			return fmt.Errorf("failed to upload empty blob: %w", err)
 		}
+
+		logger.DebugContext(ctx, "saved empty file to azure blob storage", "file_name", fileName)
+
 		return nil
 	}
 
 	_, err = blockBlobClient.CommitBlockList(ctx, blockIDs, &blockblob.CommitBlockListOptions{})
 	if err != nil {
+		logger.ErrorContext(ctx, "failed to save file to azure blob storage",
+			"file_name", fileName, "error", err)
+
 		return fmt.Errorf("failed to commit block list: %w", err)
 	}
+
+	logger.DebugContext(ctx, fmt.Sprintf("saved file to azure blob storage: %d blocks in %s",
+		len(blockIDs), time.Since(startedAt)), "file_name", fileName)
 
 	return nil
 }
 
 func (s *AzureBlobStorage) GetFile(
+	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
+	logger *slog.Logger,
 	fileName string,
 ) (io.ReadCloser, error) {
 	client, err := s.getClient(encryptor)
@@ -167,20 +191,51 @@ func (s *AzureBlobStorage) GetFile(
 
 	blobName := s.buildBlobName(fileName)
 
-	response, err := client.DownloadStream(
-		context.TODO(),
-		s.ContainerName,
-		blobName,
-		nil,
-	)
+	properties, err := client.ServiceClient().
+		NewContainerClient(s.ContainerName).
+		NewBlobClient(blobName).
+		GetProperties(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download blob from Azure: %w", err)
+		return nil, fmt.Errorf("failed to stat blob in Azure: %w", err)
 	}
 
-	return response.Body, nil
+	return io_utils.NewResumingReader(io_utils.ResumingReaderSpec{
+		StreamCtx:  ctx,
+		Logger:     logger,
+		FileName:   fileName,
+		TotalBytes: getBlobSizeOrUnknown(properties.ContentLength),
+		OpenAtOffset: func(attemptCtx context.Context, offsetBytes int64) (io.ReadCloser, error) {
+			return s.downloadBlobFromOffset(attemptCtx, client, blobName, offsetBytes)
+		},
+		IsRetryableError: isRetryableAzureError,
+	}), nil
 }
 
-func (s *AzureBlobStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
+func isRetryableAzureError(err error) bool {
+	var responseError *azcore.ResponseError
+	if errors.As(err, &responseError) {
+		return responseError.StatusCode == http.StatusRequestTimeout ||
+			responseError.StatusCode == http.StatusTooManyRequests ||
+			responseError.StatusCode >= http.StatusInternalServerError
+	}
+
+	return true
+}
+
+func getBlobSizeOrUnknown(contentLength *int64) int64 {
+	if contentLength == nil {
+		return io_utils.UnknownTotalBytes
+	}
+
+	return *contentLength
+}
+
+func (s *AzureBlobStorage) DeleteFile(
+	ctx context.Context,
+	encryptor encryption.FieldEncryptor,
+	logger *slog.Logger,
+	fileName string,
+) error {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return err
@@ -188,22 +243,30 @@ func (s *AzureBlobStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileN
 
 	blobName := s.buildBlobName(fileName)
 
-	ctx, cancel := context.WithTimeout(context.Background(), azureDeleteTimeout)
+	// Deletes run from cleanup paths whose caller context is often already cancelled, so the
+	// operation carries its own deadline; the caller's ctx stays for log correlation only.
+	deleteCtx, cancel := context.WithTimeout(context.Background(), azureDeleteTimeout)
 	defer cancel()
 
+	if err := s.discardUncommittedBlocks(deleteCtx, client, blobName); err != nil {
+		return err
+	}
+
 	_, err = client.DeleteBlob(
-		ctx,
+		deleteCtx,
 		s.ContainerName,
 		blobName,
 		nil,
 	)
 	if err != nil {
-		var respErr *azcore.ResponseError
-		if errors.As(err, &respErr) && respErr.StatusCode == 404 {
+		if isAzureNotFound(err) {
 			return nil
 		}
+
 		return fmt.Errorf("failed to delete blob from Azure: %w", err)
 	}
+
+	logger.DebugContext(ctx, "deleted file from azure blob storage", "file_name", fileName)
 
 	return nil
 }
@@ -246,12 +309,10 @@ func (s *AzureBlobStorage) TestConnection(encryptor encryption.FieldEncryptor) e
 	containerClient := client.ServiceClient().NewContainerClient(s.ContainerName)
 	_, err = containerClient.GetProperties(ctx, nil)
 	if err != nil {
-		var respErr *azcore.ResponseError
-		if errors.As(err, &respErr) {
-			if respErr.StatusCode == 404 {
-				return fmt.Errorf("container '%s' does not exist", s.ContainerName)
-			}
+		if isAzureNotFound(err) {
+			return fmt.Errorf("container '%s' does not exist", s.ContainerName)
 		}
+
 		if errors.Is(err, context.DeadlineExceeded) {
 			return errors.New("failed to connect to Azure Blob Storage. Please check params")
 		}
@@ -326,6 +387,59 @@ func (s *AzureBlobStorage) Update(incoming *AzureBlobStorage) {
 	if incoming.AccountKey != "" {
 		s.AccountKey = incoming.AccountKey
 	}
+}
+
+// An interrupted upload leaves staged blocks that no blob points at, and Azure
+// keeps billing for them for a week. There is no API that drops them, so cleanup
+// commits an empty list, which turns them into a zero-length blob the delete then
+// removes. Existence is the guard rather than the committed block list, because a
+// blob written with a single Put Blob has no committed blocks and committing an
+// empty list over it would truncate real content.
+//
+// This assumes Azure answers Get Block List for a blob that was never committed.
+// Nothing here can detect it if Azure ever answers 404 instead.
+func (s *AzureBlobStorage) discardUncommittedBlocks(
+	ctx context.Context,
+	client *azblob.Client,
+	blobName string,
+) error {
+	containerClient := client.ServiceClient().NewContainerClient(s.ContainerName)
+
+	_, err := containerClient.NewBlobClient(blobName).GetProperties(ctx, nil)
+	if err == nil {
+		return nil
+	}
+
+	if !isAzureNotFound(err) {
+		return fmt.Errorf("failed to inspect azure blob: %w", err)
+	}
+
+	blockBlobClient := containerClient.NewBlockBlobClient(blobName)
+
+	blocks, err := blockBlobClient.GetBlockList(ctx, blockblob.BlockListTypeAll, nil)
+	if err != nil {
+		if isAzureNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("failed to list azure blocks: %w", err)
+	}
+
+	if len(blocks.UncommittedBlocks) == 0 {
+		return nil
+	}
+
+	if _, err := blockBlobClient.CommitBlockList(ctx, nil, nil); err != nil {
+		return fmt.Errorf("failed to discard uncommitted azure blocks: %w", err)
+	}
+
+	return nil
+}
+
+func isAzureNotFound(err error) bool {
+	var responseError *azcore.ResponseError
+
+	return errors.As(err, &responseError) && responseError.StatusCode == http.StatusNotFound
 }
 
 func (s *AzureBlobStorage) buildBlobName(fileName string) string {
@@ -416,4 +530,36 @@ func (s *AzureBlobStorage) buildAccountURL() string {
 	}
 
 	return fmt.Sprintf("https://%s.blob.core.windows.net/", s.AccountName)
+}
+
+func (s *AzureBlobStorage) downloadBlobFromOffset(
+	attemptCtx context.Context,
+	client *azblob.Client,
+	blobName string,
+	offsetBytes int64,
+) (io.ReadCloser, error) {
+	response, err := client.DownloadStream(
+		attemptCtx,
+		s.ContainerName,
+		blobName,
+		&azblob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: offsetBytes}},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download blob from Azure: %w", err)
+	}
+
+	if offsetBytes > 0 {
+		contentRange := ""
+		if response.ContentRange != nil {
+			contentRange = *response.ContentRange
+		}
+
+		if err := io_utils.VerifyContentRangeStart(contentRange, offsetBytes); err != nil {
+			_ = response.Body.Close()
+
+			return nil, err
+		}
+	}
+
+	return response.Body, nil
 }

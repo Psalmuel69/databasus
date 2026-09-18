@@ -66,7 +66,9 @@ export const RegisterInstanceComponent = ({
   const { message } = App.useApp();
   const isEditMode = !!existingInstance?.id;
   const [instance, setInstance] = useState<DatabaseInstance>(() =>
-    existingInstance ? createEditInitialInstance(existingInstance) : createInitialInstance(workspaceId),
+    existingInstance
+      ? createEditInitialInstance(existingInstance)
+      : createInitialInstance(workspaceId),
   );
   const [isSaving, setIsSaving] = useState(false);
 
@@ -96,7 +98,8 @@ export const RegisterInstanceComponent = ({
       onSaved(saved);
     } catch (error) {
       message.error(
-        (error as Error).message || (isEditMode ? 'Failed to update instance' : 'Failed to register instance'),
+        (error as Error).message ||
+          (isEditMode ? 'Failed to update instance' : 'Failed to register instance'),
       );
     }
 
@@ -118,7 +121,8 @@ export const RegisterInstanceComponent = ({
   const showClientCertFields = isPostgres && instance.sslMode !== PostgresSslMode.Disable;
   const showRootCertField =
     isPostgres &&
-    (instance.sslMode === PostgresSslMode.VerifyCa || instance.sslMode === PostgresSslMode.VerifyFull);
+    (instance.sslMode === PostgresSslMode.VerifyCa ||
+      instance.sslMode === PostgresSslMode.VerifyFull);
 
   const isAllFieldsFilled =
     !!instance.name.trim() &&

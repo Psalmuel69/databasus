@@ -20,3 +20,9 @@ jobs:
         with:
           fail-on-severity: high
           comment-summary-in-pr: on-failure
+          # GHSA-2v4p-qf9q-27wj only affects servers built with xds.NewGRPCServer(); grpc-go
+          # is pulled in transitively as an OTLP log-export client and never runs an xDS
+          # server here. No stable release fixes it yet (only master and 1.82.2/1.83.2
+          # backports), so pinning a version can't resolve this - it's a genuine false
+          # positive for this codebase.
+          allow-ghsas: GHSA-2v4p-qf9q-27wj

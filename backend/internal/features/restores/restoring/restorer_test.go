@@ -1,10 +1,15 @@
 package restoring
 
 import (
+	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"databasus-backend/internal/config"
 	backups_controllers_logical "databasus-backend/internal/features/backups/backups/controllers/logical"
@@ -18,19 +23,44 @@ import (
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
-	cache_utils "databasus-backend/internal/util/cache"
+	"databasus-backend/internal/util/cache"
 )
 
-func Test_MakeRestore_WhenCacheMissed_RestoreFails(t *testing.T) {
-	cache_utils.ClearAllCache()
+func Test_GetRestoreDatabaseCache_WhenProviderFails_UsesSuppliedMetadata(t *testing.T) {
+	databaseConfiguration := &postgresql_logical.PostgresqlLogicalDatabase{Host: "database.internal"}
+	databaseCacheFallback := &RestoreDatabaseCache{
+		PostgresqlLogicalDatabase: databaseConfiguration,
+	}
+	restorer := &Restorer{
+		restoreDatabaseCache: cache.NewJSONStore[RestoreDatabaseCache](
+			NewFailingRestoreMetadataStore(errors.New("provider failed")),
+			"restore_db",
+		),
+	}
+	testLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	databaseCache := restorer.getRestoreDatabaseCache(
+		t.Context(),
+		restoreMetadataLookup{
+			restoreID:             uuid.New(),
+			fallbackDatabaseCache: databaseCacheFallback,
+		},
+		testLogger,
+	)
+
+	assert.Same(t, databaseConfiguration, databaseCache.PostgresqlLogicalDatabase)
+}
+
+func Test_MakeRestore_WhenCacheMissed_RestoreFails(t *testing.T) {
+	cache.GetStore().Clear(t.Context())
+
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
-	backups_config_logical.EnableBackupsForTestDatabase(database.ID, storage)
+	backups_config_logical.EnableBackupsForTestDatabase(t.Context(), database.ID, storage)
 
 	defer func() {
 		backupRepo := backups_core_logical.BackupRepository{}
@@ -49,13 +79,13 @@ func Test_MakeRestore_WhenCacheMissed_RestoreFails(t *testing.T) {
 			restoreRepo.DeleteByID(restore.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 
-		cache_utils.ClearAllCache()
+		cache.GetStore().Clear(t.Context())
 	}()
 
 	backup := backups_controllers_logical.CreateTestBackup(database.ID, storage.ID)
@@ -71,7 +101,7 @@ func Test_MakeRestore_WhenCacheMissed_RestoreFails(t *testing.T) {
 
 	// Create restorer and execute restore (should fail due to cache miss)
 	restorer := CreateTestRestorer()
-	restorer.MakeRestore(restore.ID)
+	restorer.MakeRestore(t.Context(), restore.ID, nil)
 
 	// Verify restore failed with appropriate error message
 	updatedRestore, err := restoreRepository.FindByID(restore.ID)
@@ -86,15 +116,15 @@ func Test_MakeRestore_WhenCacheMissed_RestoreFails(t *testing.T) {
 }
 
 func Test_MakeRestore_WhenTaskStarts_CacheDeletedImmediately(t *testing.T) {
-	cache_utils.ClearAllCache()
+	cache.GetStore().Clear(t.Context())
 
-	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
 	router := CreateTestRouter()
-	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), "Test Workspace", user, router)
 	storage := storages.CreateTestStorage(workspace.ID)
 	notifier := notifiers.CreateTestNotifier(workspace.ID)
 	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
-	backups_config_logical.EnableBackupsForTestDatabase(database.ID, storage)
+	backups_config_logical.EnableBackupsForTestDatabase(t.Context(), database.ID, storage)
 
 	defer func() {
 		backupRepo := backups_core_logical.BackupRepository{}
@@ -117,13 +147,13 @@ func Test_MakeRestore_WhenTaskStarts_CacheDeletedImmediately(t *testing.T) {
 			restoreRepo.DeleteByID(restore.ID)
 		}
 
-		databases.RemoveTestDatabase(database)
+		databases.RemoveTestDatabase(t.Context(), database)
 		time.Sleep(50 * time.Millisecond)
 		notifiers.RemoveTestNotifier(notifier)
-		storages.RemoveTestStorage(storage.ID)
-		workspaces_testing.RemoveTestWorkspace(workspace, router)
+		storages.RemoveTestStorage(t.Context(), storage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
 
-		cache_utils.ClearAllCache()
+		cache.GetStore().Clear(t.Context())
 	}()
 
 	backup := backups_controllers_logical.CreateTestBackup(database.ID, storage.ID)
@@ -148,17 +178,26 @@ func Test_MakeRestore_WhenTaskStarts_CacheDeletedImmediately(t *testing.T) {
 			Version:  "16",
 		},
 	}
-	restoreDatabaseCache.SetWithExpiration(restore.ID.String(), dbCache, 1*time.Hour)
+	require.NoError(t, restoreDatabaseCache.SetWithLifetime(
+		t.Context(),
+		cache.ExpiringValue[RestoreDatabaseCache]{
+			Key:      restore.ID.String(),
+			Value:    *dbCache,
+			Lifetime: time.Hour,
+		},
+	))
 
 	// Verify cache exists before restore starts
-	cachedDB := restoreDatabaseCache.Get(restore.ID.String())
+	cachedDB, err := restoreDatabaseCache.Get(t.Context(), restore.ID.String())
+	require.NoError(t, err)
 	assert.NotNil(t, cachedDB, "Cache should exist before restore starts")
 
 	// Start restore (this will call GetAndDelete)
 	restorer := CreateTestRestorer()
-	restorer.MakeRestore(restore.ID)
+	restorer.MakeRestore(t.Context(), restore.ID, nil)
 
 	// Verify cache was deleted immediately
-	cachedDBAfter := restoreDatabaseCache.Get(restore.ID.String())
+	cachedDBAfter, err := restoreDatabaseCache.Get(t.Context(), restore.ID.String())
+	require.NoError(t, err)
 	assert.Nil(t, cachedDBAfter, "Cache should be deleted immediately when task starts")
 }

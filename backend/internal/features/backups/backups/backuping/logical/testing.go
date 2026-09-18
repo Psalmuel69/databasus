@@ -15,11 +15,13 @@ import (
 	"databasus-backend/internal/features/databases"
 	"databasus-backend/internal/features/notifiers"
 	"databasus-backend/internal/features/storages"
+	users_enums "databasus-backend/internal/features/users/enums"
+	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_controllers "databasus-backend/internal/features/workspaces/controllers"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
 	"databasus-backend/internal/storage"
-	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/cache"
 	"databasus-backend/internal/util/logger"
 )
 
@@ -65,13 +67,60 @@ func SeedInProgressTestBackup(
 ) *backups_core_logical.LogicalBackup {
 	t.Helper()
 
+	backupID := uuid.New()
+
+	// The scheduler names a backup before anything writes to storage, so a seeded
+	// row without a name is a state production never reaches.
 	return seedBackup(t, "in-progress", &backups_core_logical.LogicalBackup{
-		ID:         uuid.New(),
+		ID:         backupID,
 		DatabaseID: databaseID,
 		StorageID:  storageID,
+		FileName:   "seeded-" + backupID.String(),
 		Status:     backups_core_logical.BackupStatusInProgress,
 		CreatedAt:  time.Now().UTC(),
 	})
+}
+
+type BackupTestFixture struct {
+	Storage  *storages.Storage
+	Notifier *notifiers.Notifier
+	Database *databases.Database
+}
+
+func CreateBackupTestFixture(t *testing.T, workspaceName string) *BackupTestFixture {
+	t.Helper()
+
+	if err := cache.GetStore().Clear(t.Context()); err != nil {
+		t.Fatalf("clear cache before backup fixture: %v", err)
+	}
+
+	user := users_testing.CreateTestUser(t.Context(), users_enums.UserRoleAdmin)
+	router := CreateTestRouter()
+	workspace := workspaces_testing.CreateTestWorkspace(t.Context(), workspaceName, user, router)
+	createdStorage := storages.CreateTestStorage(workspace.ID)
+	createdNotifier := notifiers.CreateTestNotifier(workspace.ID)
+	createdDatabase := databases.CreateTestDatabase(workspace.ID, createdStorage, createdNotifier)
+
+	backups_config_logical.EnableBackupsForTestDatabase(t.Context(), createdDatabase.ID, createdStorage)
+
+	t.Cleanup(func() {
+		backups, _ := backupRepository.FindByDatabaseID(createdDatabase.ID)
+		for _, backup := range backups {
+			if err := backupRepository.DeleteByID(backup.ID); err != nil {
+				t.Errorf("clean up backup %s: %v", backup.ID, err)
+			}
+		}
+
+		databases.RemoveTestDatabase(t.Context(), createdDatabase)
+		// The database delete cascades; removing its storage and notifier before that lands leaves
+		// the rows behind.
+		time.Sleep(50 * time.Millisecond)
+		notifiers.RemoveTestNotifier(createdNotifier)
+		storages.RemoveTestStorage(t.Context(), createdStorage.ID)
+		workspaces_testing.RemoveTestWorkspace(t.Context(), workspace, router)
+	})
+
+	return &BackupTestFixture{createdStorage, createdNotifier, createdDatabase}
 }
 
 func CreateTestRouter() *gin.Engine {
@@ -88,9 +137,8 @@ func CreateTestRouter() *gin.Engine {
 func CreateTestBackupCleaner() *BackupCleaner {
 	return &BackupCleaner{
 		backupRepository,
-		storages.GetStorageService(),
+		storages.GetStorageFileStore(),
 		backups_config_logical.GetBackupConfigService(),
-		encryption.GetFieldEncryptor(),
 		logger.GetLogger(),
 		[]backups_core_logical.BackupRemoveListener{},
 		atomic.Bool{},
@@ -100,13 +148,12 @@ func CreateTestBackupCleaner() *BackupCleaner {
 func CreateTestBackuper() *Backuper {
 	return &Backuper{
 		databases.GetDatabaseService(),
-		encryption.GetFieldEncryptor(),
 		workspaces_services.GetWorkspaceService(),
 		backupRepository,
 		backups_config_logical.GetBackupConfigService(),
-		storages.GetStorageService(),
+		storages.GetStorageFileStore(),
 		notifiers.GetNotifierService(),
-		taskCancelManager,
+		taskCancellationRegistry,
 		logger.GetLogger(),
 		usecases_logical.GetCreateBackupUsecase(),
 	}
@@ -115,13 +162,12 @@ func CreateTestBackuper() *Backuper {
 func CreateTestBackuperWithUseCase(useCase backups_core_logical.CreateBackupUsecase) *Backuper {
 	return &Backuper{
 		databases.GetDatabaseService(),
-		encryption.GetFieldEncryptor(),
 		workspaces_services.GetWorkspaceService(),
 		backupRepository,
 		backups_config_logical.GetBackupConfigService(),
-		storages.GetStorageService(),
+		storages.GetStorageFileStore(),
 		notifiers.GetNotifierService(),
-		taskCancelManager,
+		taskCancellationRegistry,
 		logger.GetLogger(),
 		useCase,
 	}
@@ -138,7 +184,7 @@ func CreateTestSchedulerWithBackuper(backuper *Backuper) *BackupsScheduler {
 	return &BackupsScheduler{
 		backupRepository,
 		backups_config_logical.GetBackupConfigService(),
-		taskCancelManager,
+		taskCancellationRequester,
 		databases.GetDatabaseService(),
 		time.Now().UTC(),
 		logger.GetLogger(),
@@ -195,14 +241,7 @@ func WaitForBackupCompletion(
 	t.Logf("WaitForBackupCompletion: timeout waiting for backup to complete")
 }
 
-// StartSchedulerForTest starts the BackupsScheduler in a goroutine for testing.
-// The scheduler subscribes to task completions and manages backup lifecycle.
-// Returns a context cancel function that should be deferred to stop the scheduler.
-//
-// PubSubManager.Subscribe handshakes with Valkey before returning, so we
-// don't need to sleep here waiting for the subscription to register. Poll
-// the scheduler's hasRun flag instead to be sure Run() has entered its
-// loop before the caller proceeds.
+// Polling hasRun prevents the caller from racing scheduler startup without relying on a timing delay.
 func StartSchedulerForTest(t *testing.T, scheduler *BackupsScheduler) context.CancelFunc {
 	ctx, cancel := context.WithCancel(context.Background())
 

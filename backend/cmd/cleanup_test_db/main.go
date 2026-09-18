@@ -12,9 +12,8 @@
 //     with "permission denied for schema public".
 //
 // Reads the test DSN through config (config.GetEnv() auto-swaps DatabaseDsn to
-// TestDatabaseDsn when IsTesting is true). IsTesting is detected from os.Args
-// containing the substring "test" - the binary path "cleanup_test_db" satisfies
-// that. Renaming the binary or its directory will break detection.
+// TestDatabaseDsn when IsTesting is true). The executable name cleanup_test_db
+// selects that mode.
 package main
 
 import (
@@ -31,7 +30,6 @@ import (
 	gormLogger "gorm.io/gorm/logger"
 
 	"databasus-backend/internal/config"
-	cache_utils "databasus-backend/internal/util/cache"
 	"databasus-backend/internal/util/logger"
 )
 
@@ -48,12 +46,7 @@ func main() {
 
 	env := config.GetEnv()
 	if !env.IsTesting {
-		log.Error("cleanup_test_db must run with IsTesting=true (binary name must contain 'test')")
-		os.Exit(1)
-	}
-
-	if err := resetValkey(log); err != nil {
-		log.Error("failed to reset Valkey", "error", err)
+		log.Error("cleanup_test_db must run with IsTesting=true")
 		os.Exit(1)
 	}
 
@@ -66,22 +59,6 @@ func main() {
 		log.Error("failed to reset test PG containers", "error", err)
 		os.Exit(1)
 	}
-}
-
-// resetValkey wipes every key so each `make test` starts from a clean cache.
-// Without this, a -failfast'd previous run can leave in-flight backup claims and
-// other state that breaks the next run's scheduler assumptions.
-func resetValkey(log *slog.Logger) error {
-	log.Info("resetting Valkey")
-
-	// FLUSHALL, not ClearAllCache: parallel test workers each use their own Valkey
-	// logical DB (0..pool-1), so a per-DB clear would leave the others dirty.
-	if err := cache_utils.FlushAll(); err != nil {
-		return fmt.Errorf("flush cache: %w", err)
-	}
-
-	log.Info("Valkey reset complete")
-	return nil
 }
 
 // resetMetadataDb drops and recreates the metadata DB for every test worker slot
@@ -174,7 +151,7 @@ func resetOnePostgresContainer(ctx context.Context, log *slog.Logger, host, labe
 			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
 			quoteLiteral(name),
 		)); err != nil {
-			log.Warn("could not terminate connections to DB", "db", name, "error", err)
+			log.WarnContext(ctx, "could not terminate connections to DB", "db", name, "error", err)
 		}
 
 		// No WITH (FORCE) - that's PG 13+ only and we support PG 12.
@@ -209,11 +186,11 @@ func resetOnePostgresContainer(ctx context.Context, log *slog.Logger, host, labe
 		_, _ = db.ExecContext(ctx, fmt.Sprintf("DROP OWNED BY %s", quotedRole))
 
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP ROLE IF EXISTS %s", quotedRole)); err != nil {
-			log.Warn("could not drop role", "role", role, "error", err)
+			log.WarnContext(ctx, "could not drop role", "role", role, "error", err)
 		}
 	}
 
-	log.Info("test PG container reset complete")
+	log.InfoContext(ctx, "test PG container reset complete")
 	return nil
 }
 
@@ -255,11 +232,11 @@ func dropDatabasusReplicationSlots(ctx context.Context, log *slog.Logger, db *sq
 		)
 
 		if _, err := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", name); err != nil {
-			log.Warn("could not drop replication slot", "slot_name", name, "error", err)
+			log.WarnContext(ctx, "could not drop replication slot", "slot_name", name, "error", err)
 			continue
 		}
 
-		log.Info("dropped leftover replication slot", "slot_name", name)
+		log.InfoContext(ctx, "dropped leftover replication slot", "slot_name", name)
 	}
 
 	return nil

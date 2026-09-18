@@ -1,10 +1,16 @@
 package rclone_storage
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/logger"
 )
 
 func Test_ParseConfigContent_SingleRemote_ParsedCorrectly(t *testing.T) {
@@ -115,4 +121,62 @@ func Test_ParseConfigContent_WhitespaceAroundKeysAndValues_Trimmed(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, "s3", sections["myremote"]["type"])
 	assert.Equal(t, "us-west-2", sections["myremote"]["region"])
+}
+
+// getFs strips a leading slash from RemotePath, so an absolute root would become
+// relative to the working directory. The test moves there instead and leaves the
+// remote path empty, which puts the rclone root on the temporary directory.
+func newLocalRcloneStorage(t *testing.T) (*RcloneStorage, string) {
+	t.Helper()
+
+	// The first Encrypt resolves the secret key through config.GetEnv(), which finds
+	// the module root by walking up from the working directory and loads .env from
+	// above it, so it has to run before the test moves.
+	config, err := encryption.GetFieldEncryptor().Encrypt("[testlocal]\ntype = local\n")
+	require.NoError(t, err)
+
+	root := t.TempDir()
+	t.Chdir(root)
+
+	return &RcloneStorage{
+		StorageID:     uuid.New(),
+		ConfigContent: config,
+	}, root
+}
+
+func Test_DeleteFile_WhenObjectExists_RemovesOnlyThatPath(t *testing.T) {
+	storage, root := newLocalRcloneStorage(t)
+
+	for _, name := range []string{"backup-1", "backup-10", "backup-1.metadata"} {
+		require.NoError(t, os.WriteFile(filepath.Join(root, name), []byte("payload"), 0o600))
+	}
+
+	err := storage.DeleteFile(t.Context(), encryption.GetFieldEncryptor(), logger.GetLogger(), "backup-1")
+
+	require.NoError(t, err)
+	assert.NoFileExists(t, filepath.Join(root, "backup-1"))
+	assert.FileExists(t, filepath.Join(root, "backup-10"), "a similarly named object must survive")
+	assert.FileExists(t, filepath.Join(root, "backup-1.metadata"), "a sidecar is its own logical file")
+}
+
+func Test_DeleteFile_WhenObjectIsAbsent_Succeeds(t *testing.T) {
+	storage, _ := newLocalRcloneStorage(t)
+
+	err := storage.DeleteFile(t.Context(), encryption.GetFieldEncryptor(), logger.GetLogger(), "never-written")
+
+	assert.NoError(t, err)
+}
+
+func Test_DeleteFile_WhenCalledTwice_Succeeds(t *testing.T) {
+	storage, root := newLocalRcloneStorage(t)
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "backup-1"), []byte("payload"), 0o600))
+
+	require.NoError(t, storage.DeleteFile(
+		t.Context(), encryption.GetFieldEncryptor(), logger.GetLogger(), "backup-1",
+	))
+
+	assert.NoError(t, storage.DeleteFile(
+		t.Context(), encryption.GetFieldEncryptor(), logger.GetLogger(), "backup-1",
+	))
 }

@@ -43,16 +43,15 @@ func (uc *CreateIncrementalBackupUsecase) Execute(
 	}
 	defer creds.Remove()
 
-	refusalResult, canProceed := verifyIncrTimelineCompatibility(ctx, spec)
+	refusalResult, rootFullTimelineID, canProceed := verifyIncrTimelineCompatibility(ctx, spec)
 	if !canProceed {
 		return refusalResult, nil
 	}
 
-	// Gate on WAL-summarizer readiness BEFORE any work: a doomed
-	// pg_basebackup --incremental (summarizer off / summaries expired / falling
-	// behind) is turned into a deterministic CHAIN_BROKEN here, so the next
-	// scheduler tick re-anchors on a fresh FULL instead of looping transient
-	// ERRORs. Runs before the parent-manifest download so a bail costs nothing.
+	// Gate on WAL-summarizer readiness BEFORE any work: summarizer off and expired
+	// summaries are conditions no retry can fix, so they close the chain here rather
+	// than after a doomed pg_basebackup --incremental. Runs before the
+	// parent-manifest download so a bail costs nothing.
 	preCheckResult, canProceed := runSummarizerPreCheck(ctx, spec)
 	if !canProceed {
 		return preCheckResult, nil
@@ -61,7 +60,7 @@ func (uc *CreateIncrementalBackupUsecase) Execute(
 	// Manifest System-Identifier from the stored row (see create_full_uc.go Execute).
 	systemID := spec.SourceDB.SystemIdentifierUint64()
 
-	manifestPath, manifestCleanup, err := downloadParentManifest(spec)
+	manifestPath, manifestCleanup, err := downloadParentManifest(ctx, spec)
 	if err != nil {
 		reason := physical_enums.PhysicalBackupErrorParentManifestMissing
 
@@ -74,28 +73,34 @@ func (uc *CreateIncrementalBackupUsecase) Execute(
 	}
 	defer manifestCleanup()
 
-	fileName := buildObjectName(spec.DatabaseName, spec.Backup.ID, start, "INCR")
+	label := buildBackupLabel(spec.DatabaseName, spec.Backup.ID, start, "INCR")
 
-	spec.Backup.FileName = &fileName
+	// Every codec attempt gets its own object key, and the row has to carry it
+	// before the bytes leave, or a failed attempt leaves a file nothing names.
+	mintAndSaveAttemptName := func() (string, error) {
+		attemptName := buildObjectName(label, uuid.New())
 
-	if err := spec.IncrRepo.Save(spec.Backup); err != nil {
-		return errorResult(physical_enums.PhysicalBackupErrorStorageUploadFailed,
-			"persist file_name at upload-start", err), nil
+		spec.Backup.FileName = &attemptName
+		if err := spec.IncrRepo.Save(spec.Backup); err != nil {
+			return "", fmt.Errorf("persist file_name at upload-start: %w", err)
+		}
+
+		return attemptName, nil
 	}
 
 	var result PhysicalBackupResult
 
 	slotErr := WithBackupSlot(ctx, spec.SourceDB, spec.FieldEncryptor, spec.Logger, func() error {
-		streamResult, err := streamWithCodecFallback(
-			ctx,
-			spec.CommonBackupSpec,
-			spec.Backup.ID,
-			creds,
-			fileName,
-			systemID,
-			manifestPath,
-			classifyIncrStreamError,
-		)
+		streamResult, err := streamWithCodecFallback(ctx, streamAttemptSpec{
+			Common:                  spec.CommonBackupSpec,
+			BackupID:                spec.Backup.ID,
+			Creds:                   creds,
+			Label:                   label,
+			SystemID:                systemID,
+			IncrementalManifestPath: manifestPath,
+			Classify:                classifyIncrStreamError,
+			MintAndSaveAttemptName:  mintAndSaveAttemptName,
+		})
 		if err != nil {
 			result = errorResult(physical_enums.PhysicalBackupErrorPgBasebackupFailed,
 				"pg_basebackup --incremental stream", err)
@@ -103,21 +108,27 @@ func (uc *CreateIncrementalBackupUsecase) Execute(
 		}
 
 		if streamResult.Status != physical_enums.PhysicalBackupStatusCompleted {
-			result = streamResult
+			result = recheckIncrementalStreamFailure(
+				ctx,
+				spec.CommonBackupSpec,
+				rootFullTimelineID,
+				streamResult,
+			)
 			return nil
 		}
 
 		streamResult.BackupDurationMs = time.Since(start).Milliseconds()
 		streamResult.CompletedAt = time.Now().UTC()
-		streamResult.FileName = fileName
 
-		if err := uploadIncrMetadata(
-			spec.Logger, spec.FieldEncryptor, spec.Storage, spec.SourceDB, spec.Backup, streamResult,
-		); err != nil {
+		metadataReceipt, err := uploadIncrMetadata(
+			spec.Logger, spec.FileStore, spec.StorageID, spec.SourceDB, spec.Backup, streamResult,
+		)
+		if err != nil {
 			result = errorResult(physical_enums.PhysicalBackupErrorStorageUploadFailed, "upload metadata", err)
 			return nil
 		}
 
+		streamResult.Receipts = append(streamResult.Receipts, metadataReceipt)
 		result = streamResult
 
 		return nil
@@ -131,38 +142,52 @@ func (uc *CreateIncrementalBackupUsecase) Execute(
 	return result, nil
 }
 
-// verifyIncrTimelineCompatibility gates an INCR on timeline/cluster
-// compatibility. Unlike a FULL, an INCR cannot extend across a timeline switch —
-// a detected failover is chain-killing, and the chain must re-anchor on a fresh
-// FULL on the new TL.
 func verifyIncrTimelineCompatibility(
 	ctx context.Context,
 	spec IncrementalBackupSpec,
-) (PhysicalBackupResult, bool) {
-	return verifyTimelineCompatibility(ctx, spec.CommonBackupSpec,
-		func(decision *TimelineDecision) (PhysicalBackupResult, bool) {
-			reason := physical_enums.PhysicalBackupErrorTimelineRegression
+) (PhysicalBackupResult, int, bool) {
+	rootFull, err := spec.FullRepo.FindByID(spec.Backup.RootFullBackupID)
+	if err != nil {
+		return errorResult(physical_enums.PhysicalBackupErrorNetworkFailure, "load root FULL", err), 0, false
+	}
 
-			return PhysicalBackupResult{
-				Status:      physical_enums.PhysicalBackupStatusChainBroken,
-				ErrorReason: &reason,
-				ErrorMessage: fmt.Sprintf(
-					"timeline switch detected (live TL %d > known TL): incremental refused, new FULL required",
-					decision.NewTLI,
-				),
-				CompletedAt: time.Now().UTC(),
-			}, false
-		})
+	if rootFull == nil || rootFull.Status != physical_enums.PhysicalBackupStatusCompleted {
+		reason := physical_enums.PhysicalBackupErrorParentManifestMissing
+
+		return PhysicalBackupResult{
+			Status:       physical_enums.PhysicalBackupStatusChainBroken,
+			ErrorReason:  &reason,
+			ErrorMessage: "root FULL is missing or incomplete",
+			CompletedAt:  time.Now().UTC(),
+		}, 0, false
+	}
+
+	conn, err := spec.SourceDB.OpenInspectionConn(ctx, spec.FieldEncryptor)
+	if err != nil {
+		return errorResult(physical_enums.PhysicalBackupErrorNetworkFailure,
+			"open inspection connection", err), 0, false
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	decision, err := CheckIncrementalTimelineCompatibility(ctx, conn, spec.SourceDB, rootFull.TimelineID)
+	if err != nil {
+		return errorResult(physical_enums.PhysicalBackupErrorNetworkFailure,
+			"timeline compatibility check", err), 0, false
+	}
+
+	refusalResult, canProceed := timelineRefusalResult(decision, true)
+
+	return refusalResult, rootFull.TimelineID, canProceed
 }
 
 // runSummarizerPreCheck opens an inspection connection and resolves the
-// WAL-summarizer decision (including the bounded wait for a lagging-but-catching-up
-// summarizer). It returns proceed=true to run the incremental, or a terminal
-// result the caller must return verbatim:
-//   - DecisionGoIncremental         → proceed
-//   - DecisionFullSameChain / wait timeout → CHAIN_BROKEN / SUMMARIZER_FALLING_BEHIND
-//   - DecisionFullNewChain          → CHAIN_BROKEN / SUMMARIZER_OFF | SUMMARIES_EXPIRED
-//   - ctx cancelled mid-wait        → CANCELED / CANCELED_BY_USER
+// WAL-summarizer decision (including the bounded wait for a summarizer that has
+// published no summary yet). It returns proceed=true to run the incremental, or
+// a terminal result the caller must return verbatim:
+//   - DecisionGoIncremental    → proceed
+//   - DecisionRetryNextCadence → ERROR / SUMMARIZER_FALLING_BEHIND
+//   - DecisionFullNewChain     → CHAIN_BROKEN / SUMMARIZER_OFF | SUMMARIES_EXPIRED
+//   - ctx cancelled mid-wait   → CANCELED / CANCELED_BY_USER
 func runSummarizerPreCheck(ctx context.Context, spec IncrementalBackupSpec) (PhysicalBackupResult, bool) {
 	conn, err := spec.SourceDB.OpenInspectionConn(ctx, spec.FieldEncryptor)
 	if err != nil {
@@ -185,22 +210,29 @@ func runSummarizerPreCheck(ctx context.Context, spec IncrementalBackupSpec) (Phy
 	case DecisionGoIncremental:
 		return PhysicalBackupResult{}, true
 
-	case DecisionFullSameChain:
-		return summarizerChainBroken(physical_enums.PhysicalBackupErrorSummarizerFallingBehind,
-			"summarizer trailing current WAL; closing chain, new FULL required"), false
+	case DecisionRetryNextCadence:
+		return summarizerRefusedResult(
+			physical_enums.PhysicalBackupStatusError,
+			physical_enums.PhysicalBackupErrorSummarizerFallingBehind,
+			"WAL summarizer is not publishing summaries (none yet, or its process is gone); retrying on the next cadence",
+		), false
 
 	default: // DecisionFullNewChain — Reason is always set on this branch
-		return summarizerChainBroken(*decision.Reason,
-			"summarizer pre-check refused incremental; new FULL required"), false
+		return summarizerRefusedResult(
+			physical_enums.PhysicalBackupStatusChainBroken,
+			*decision.Reason,
+			"summarizer pre-check refused incremental; new FULL required",
+		), false
 	}
 }
 
-func summarizerChainBroken(
+func summarizerRefusedResult(
+	status physical_enums.PhysicalBackupStatus,
 	reason physical_enums.PhysicalBackupErrorReason,
 	message string,
 ) PhysicalBackupResult {
 	return PhysicalBackupResult{
-		Status:       physical_enums.PhysicalBackupStatusChainBroken,
+		Status:       status,
 		ErrorReason:  &reason,
 		ErrorMessage: message,
 		CompletedAt:  time.Now().UTC(),
@@ -220,6 +252,7 @@ func canceledResult(
 }
 
 func downloadParentManifest(
+	ctx context.Context,
 	spec IncrementalBackupSpec,
 ) (manifestPath string, cleanup func(), err error) {
 	tmpDir, err := os.MkdirTemp(os.TempDir(), "pgincr_"+uuid.New().String())
@@ -236,7 +269,7 @@ func downloadParentManifest(
 		return "", func() {}, errors.New("storage does not support GetFile")
 	}
 
-	reader, err := storageHandle.GetFile(spec.FieldEncryptor, spec.ParentManifest.FileName)
+	reader, err := storageHandle.GetFile(ctx, spec.FieldEncryptor, spec.Logger, spec.ParentManifest.FileName)
 	if err != nil {
 		cleanupAll()
 
@@ -299,14 +332,34 @@ func decryptParentManifest(reader io.Reader, spec IncrementalBackupSpec) (io.Rea
 	return dec, nil
 }
 
+// Verbatim messages from PostgreSQL's basebackup_incremental.c and
+// walsummarizer.c, matched by substring because the timeline and LSN arguments
+// are interpolated per call.
+const (
+	summariesMissingForRangeStderr = "WAL summaries are required on timeline"
+	summarizerStalledStderr        = "WAL summarization is not progressing"
+)
+
 func classifyIncrStreamError(streamErr error, stderr []byte) streamOutcome {
+	message := fmt.Sprintf("%v; stderr: %s", streamErr, truncateStderr(stderr))
+
 	if isSummariesExpiredError(stderr) {
 		reason := physical_enums.PhysicalBackupErrorSummariesExpired
 
 		return streamOutcome{
 			Status:       physical_enums.PhysicalBackupStatusChainBroken,
 			ErrorReason:  &reason,
-			ErrorMessage: fmt.Sprintf("%v; stderr: %s", streamErr, truncateStderr(stderr)),
+			ErrorMessage: message,
+		}
+	}
+
+	if isSummarizerStalledError(stderr) {
+		reason := physical_enums.PhysicalBackupErrorSummarizerFallingBehind
+
+		return streamOutcome{
+			Status:       physical_enums.PhysicalBackupStatusError,
+			ErrorReason:  &reason,
+			ErrorMessage: message,
 		}
 	}
 
@@ -315,26 +368,22 @@ func classifyIncrStreamError(streamErr error, stderr []byte) streamOutcome {
 	return streamOutcome{
 		Status:       physical_enums.PhysicalBackupStatusError,
 		ErrorReason:  &reason,
-		ErrorMessage: fmt.Sprintf("%v; stderr: %s", streamErr, truncateStderr(stderr)),
+		ErrorMessage: message,
 	}
 }
 
 // isSummariesExpiredError detects the post-readiness-check race where the source cluster
 // pruned WAL summaries between CheckSummarizerReadiness returning OK and pg_basebackup
-// --incremental opening the actual range. PG surfaces this as "WAL summary file
-// ... not found" or "could not open WAL summary".
+// --incremental opening the actual range. The same message covers a range that was never
+// summarized at all and one summarized with a hole in the middle.
 func isSummariesExpiredError(stderr []byte) bool {
-	msg := string(stderr)
+	return strings.Contains(string(stderr), summariesMissingForRangeStderr)
+}
 
-	for _, needle := range []string{
-		"WAL summary file",
-		"could not open WAL summary",
-		"WAL summary not found",
-	} {
-		if strings.Contains(msg, needle) {
-			return true
-		}
-	}
-
-	return false
+// isSummarizerStalledError detects a summarizer that stopped absorbing WAL.
+// PostgreSQL waits for summarization through the backup start LSN and gives up
+// only after a minute without a single absorbed record, so this is a real stall
+// rather than a slow cluster.
+func isSummarizerStalledError(stderr []byte) bool {
+	return strings.Contains(string(stderr), summarizerStalledStderr)
 }

@@ -24,7 +24,7 @@ import (
 	"databasus-backend/internal/features/databases"
 	mariadbtypes "databasus-backend/internal/features/databases/databases/mariadb"
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
-	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/encryption"
 	io_utils "databasus-backend/internal/util/io"
 	"databasus-backend/internal/util/namelist"
@@ -69,50 +69,57 @@ func (uc *CreateMariadbBackupUsecase) Execute(
 	backup *backups_core_logical.LogicalBackup,
 	backupConfig *backups_config_logical.LogicalBackupConfig,
 	db *databases.Database,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
-) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info(
-		"Creating MariaDB backup via mariadb-dump",
-		"databaseId", db.ID,
-		"storageId", storage.ID,
-	)
+) (*backups_core_logical.BackupArtifacts, error) {
+	logger := uc.logger.With("database_id", db.ID, "storage_id", backup.StorageID)
 
-	mdb := db.Mariadb
-	if mdb == nil {
+	logger.InfoContext(ctx, "creating mariadb backup via mariadb-dump")
+
+	tunneledDatabase, err := databases.OpenTunnel(ctx, databases.OpenTunnelSpec{
+		Database:  db,
+		Logger:    logger,
+		Encryptor: uc.fieldEncryptor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	defer tunneledDatabase.Close()
+
+	mariadbDatabase := tunneledDatabase.GetDatabaseThroughTunnel().Mariadb
+	if mariadbDatabase == nil {
 		return nil, fmt.Errorf("mariadb database configuration is required")
 	}
 
-	if mdb.Database == nil || *mdb.Database == "" {
+	if mariadbDatabase.Database == nil || *mariadbDatabase.Database == "" {
 		return nil, fmt.Errorf("database name is required for mariadb-dump backups")
 	}
 
-	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mdb.Password)
+	decryptedPassword, err := uc.fieldEncryptor.Decrypt(mariadbDatabase.Password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt database password: %w", err)
 	}
 
-	rawSizeMB, err := mdb.GetRawDbSizeMb(ctx, uc.logger, uc.fieldEncryptor)
+	rawSizeMB, err := mariadbDatabase.GetRawDbSizeMb(ctx, logger, uc.fieldEncryptor)
 	if err != nil {
-		uc.logger.Warn("failed to fetch raw db size before backup",
-			"database_id", db.ID,
-			"error", err)
+		logger.WarnContext(ctx, "failed to fetch raw db size before backup", "error", err)
 	} else {
 		backup.BackupRawDbSizeMb = rawSizeMB
 	}
 
-	args := uc.buildMariadbDumpArgs(mdb)
+	args := uc.buildMariadbDumpArgs(mariadbDatabase)
 
 	return uc.streamToStorage(
 		ctx,
 		backup,
 		backupConfig,
-		tools.GetMariadbExecutable(mdb.Version, tools.MariadbExecutableMariadbDump),
+		tools.GetMariadbExecutable(mariadbDatabase.Version, tools.MariadbExecutableMariadbDump),
 		args,
 		decryptedPassword,
-		storage,
+		fileStore,
 		backupProgressListener,
-		mdb,
+		mariadbDatabase,
 	)
 }
 
@@ -128,17 +135,18 @@ func (uc *CreateMariadbBackupUsecase) buildMariadbDumpArgs(
 		"--quick",
 		"--skip-add-locks",
 		"--verbose",
+		// Dumping tablespace definitions makes mariadb-dump read INFORMATION_SCHEMA.FILES, which costs
+		// a global PROCESS privilege that a backup role has no other use for and that managed
+		// providers often refuse to grant.
+		"--no-tablespaces",
 	}
 
-	// One INSERT per row caps mariadb-dump memory on huge tables, but bloats the
-	// dump and makes restores far slower. Opting into extended inserts batches
-	// rows (mariadb-dump's default) for fast restores at higher backup memory.
-	if !mdb.IsUseExtendedInsert {
-		args = append(args, "--skip-extended-insert")
-	}
-
+	// Triggers are on by default, so a role without the privilege has to be opted out explicitly
+	// or mariadb-dump fails on SHOW TRIGGERS instead of dumping without them.
 	if mdb.HasPrivilege("TRIGGER") {
 		args = append(args, "--triggers")
+	} else {
+		args = append(args, "--skip-triggers")
 	}
 
 	if mdb.HasPrivilege("EVENT") && !mdb.IsExcludeEvents {
@@ -174,11 +182,11 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	mariadbBin string,
 	args []string,
 	password string,
-	storage *storages.Storage,
+	fileStore backups_core_logical.BackupFileStore,
 	backupProgressListener func(completedMBs float64),
 	mdbConfig *mariadbtypes.MariadbDatabase,
-) (*backups_core_logical.BackupMetadata, error) {
-	uc.logger.Info("Streaming MariaDB backup to storage", "mariadbBin", mariadbBin)
+) (*backups_core_logical.BackupArtifacts, error) {
+	uc.logger.InfoContext(parentCtx, "streaming MariaDB backup to storage", "mariadb_bin", mariadbBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
 	defer cancel(nil)
@@ -201,7 +209,7 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	fullArgs = append(fullArgs, args...)
 
 	cmd := exec.CommandContext(ctx, mariadbBin, fullArgs...)
-	uc.logger.Info("Executing MariaDB backup command", "command", cmd.String())
+	uc.logger.InfoContext(parentCtx, "executing MariaDB backup command", "command", cmd.String())
 
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
@@ -245,23 +253,17 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 		return nil, fmt.Errorf("failed to create zstd writer: %w", err)
 	}
 
-	saveErrCh := make(chan error, 1)
-	go func() {
-		saveErr := storage.SaveFile(
-			ctx,
-			uc.fieldEncryptor,
-			uc.logger,
-			backup.FileName,
-			storageReader,
-		)
-		if saveErr != nil {
-			_ = storageReader.CloseWithError(saveErr)
-			cancel(saveErr)
-		}
-		saveErrCh <- saveErr
-	}()
+	fileWrite := storage_files.StartBackgroundWrite(
+		ctx,
+		fileStore,
+		storage_files.StoredFileReference{StorageID: backup.StorageID, FileName: backup.FileName},
+		storageReader,
+		cancel,
+	)
 
 	if err = cmd.Start(); err != nil {
+		uc.cleanupOnCancellation(zstdWriter, encryptionWriter, storageWriter, fileWrite.Errors)
+
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(mariadbBin), err)
 	}
 
@@ -276,36 +278,41 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 	}()
 
 	copyErr := <-copyResultCh
+
+	// exec.Cmd.StderrPipe: Wait closes the pipe once it sees the process exit, so a Wait
+	// before the goroutine has drained it can truncate the very output callers need to
+	// diagnose a fast-failing client. Draining first is safe: the pipe reaches EOF as soon
+	// as the child's stderr fd closes, which happens on process exit independent of Wait.
+	stderrOutput := <-stderrCh
 	waitErr := cmd.Wait()
 
 	select {
-	case earlySaveErr := <-saveErrCh:
+	case earlySaveErr := <-fileWrite.Errors:
 		if earlySaveErr != nil {
 			_ = zstdWriter.Close()
 			_ = uc.closeWriters(encryptionWriter, storageWriter)
 			return nil, fmt.Errorf("save to storage: %w", earlySaveErr)
 		}
-		saveErrCh <- nil
+		fileWrite.Errors <- nil
 	default:
 	}
 
 	select {
 	case <-ctx.Done():
-		uc.cleanupOnCancellation(zstdWriter, encryptionWriter, storageWriter, saveErrCh)
+		uc.cleanupOnCancellation(zstdWriter, encryptionWriter, storageWriter, fileWrite.Errors)
 		return nil, uc.classifyCancellation(ctx)
 	default:
 	}
 
 	if err := zstdWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close zstd writer", "error", err)
+		uc.logger.ErrorContext(parentCtx, "failed to close zstd writer", "error", err)
 	}
 	if err := uc.closeWriters(encryptionWriter, storageWriter); err != nil {
-		<-saveErrCh
+		<-fileWrite.Errors
 		return nil, err
 	}
 
-	saveErr := <-saveErrCh
-	stderrOutput := <-stderrCh
+	saveErr := <-fileWrite.Errors
 
 	if waitErr == nil && copyErr == nil && saveErr == nil && backupProgressListener != nil {
 		compressedSizeMB := float64(compressedBytesCounter.GetBytesWritten()) / (1024 * 1024)
@@ -321,7 +328,10 @@ func (uc *CreateMariadbBackupUsecase) streamToStorage(
 		return nil, fmt.Errorf("save to storage: %w", saveErr)
 	}
 
-	return &backupMetadata, nil
+	return &backups_core_logical.BackupArtifacts{
+		Metadata: &backupMetadata,
+		Receipts: []storage_files.WriteReceipt{<-fileWrite.Receipts},
+	}, nil
 }
 
 func (uc *CreateMariadbBackupUsecase) createTempMyCnfFile(
@@ -481,7 +491,7 @@ func (uc *CreateMariadbBackupUsecase) setupBackupEncryption(
 
 	if backupConfig.Encryption != backups_core_enums.BackupEncryptionEncrypted {
 		metadata.Encryption = backups_core_enums.BackupEncryptionNone
-		uc.logger.Info("Encryption disabled for backup", "backupId", backupID)
+		uc.logger.Info("encryption disabled for backup", "backup_id", backupID)
 		return storageWriter, nil, metadata, nil
 	}
 
@@ -499,7 +509,7 @@ func (uc *CreateMariadbBackupUsecase) setupBackupEncryption(
 	metadata.EncryptionIV = &encSetup.NonceBase64
 	metadata.Encryption = backups_core_enums.BackupEncryptionEncrypted
 
-	uc.logger.Info("Encryption enabled for backup", "backupId", backupID)
+	uc.logger.Info("encryption enabled for backup", "backup_id", backupID)
 	return encSetup.Writer, encSetup.Writer, metadata, nil
 }
 
@@ -507,7 +517,7 @@ func (uc *CreateMariadbBackupUsecase) cleanupOnCancellation(
 	zstdWriter *zstd.Encoder,
 	encryptionWriter *backup_encryption.EncryptionWriter,
 	storageWriter io.WriteCloser,
-	saveErrCh chan error,
+	writeErrors chan error,
 ) {
 	if zstdWriter != nil {
 		go func() {
@@ -534,10 +544,10 @@ func (uc *CreateMariadbBackupUsecase) cleanupOnCancellation(
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer during cancellation", "error", err)
+		uc.logger.Error("failed to close pipe writer during cancellation", "error", err)
 	}
 
-	<-saveErrCh
+	<-writeErrors
 }
 
 func (uc *CreateMariadbBackupUsecase) closeWriters(
@@ -549,7 +559,7 @@ func (uc *CreateMariadbBackupUsecase) closeWriters(
 		go func() {
 			closeErr := encryptionWriter.Close()
 			if closeErr != nil {
-				uc.logger.Error("Failed to close encrypting writer", "error", closeErr)
+				uc.logger.Error("failed to close encrypting writer", "error", closeErr)
 			}
 			encryptionCloseErrCh <- closeErr
 		}()
@@ -560,13 +570,13 @@ func (uc *CreateMariadbBackupUsecase) closeWriters(
 	encryptionCloseErr := <-encryptionCloseErrCh
 	if encryptionCloseErr != nil {
 		if err := storageWriter.Close(); err != nil {
-			uc.logger.Error("Failed to close pipe writer after encryption error", "error", err)
+			uc.logger.Error("failed to close pipe writer after encryption error", "error", err)
 		}
 		return fmt.Errorf("failed to close encryption writer: %w", encryptionCloseErr)
 	}
 
 	if err := storageWriter.Close(); err != nil {
-		uc.logger.Error("Failed to close pipe writer", "error", err)
+		uc.logger.Error("failed to close pipe writer", "error", err)
 		return err
 	}
 

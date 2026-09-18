@@ -96,9 +96,14 @@ func openPostgresInstanceConn(
 		return nil, nil, err
 	}
 
-	connString := postgresql_shared.BuildConnString(spec, password, postgresMaintenanceDatabase, files)
+	connConfig, err := postgresql_shared.BuildConnConfig(spec, password, postgresMaintenanceDatabase, files)
+	if err != nil {
+		files.Remove()
 
-	conn, err := pgx.Connect(ctx, connString)
+		return nil, nil, err
+	}
+
+	conn, err := pgx.ConnectConfig(ctx, connConfig)
 	if err != nil {
 		files.Remove()
 

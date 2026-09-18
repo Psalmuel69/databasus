@@ -24,7 +24,7 @@ import (
 	"databasus-backend/internal/util/logger"
 )
 
-var taskCancelManager = task_cancellation.GetTaskCancelManager()
+var taskCancellationRequester = task_cancellation.GetRequester()
 
 var backupService = &LogicalBackupService{
 	databases.GetDatabaseService(),
@@ -40,7 +40,7 @@ var backupService = &LogicalBackupService{
 	[]backups_core_logical.BackupRemoveListener{},
 	workspaces_services.GetWorkspaceService(),
 	audit_logs.GetAuditLogService(),
-	taskCancelManager,
+	taskCancellationRequester,
 	backups_download.GetDownloadTokenService(),
 	backuping_logical.GetBackupsScheduler(),
 	backuping_logical.GetBackupCleaner(),
@@ -78,5 +78,6 @@ var SetupDependencies = sync.OnceFunc(func() {
 		SetDatabaseStorageChangeListener(backupService)
 
 	databases.GetDatabaseService().AddDbRemoveListener(backupService)
+	storages.GetStorageService().AddStorageBackupCounter(backupService)
 	databases.GetDatabaseService().AddDbCopyListener(backups_config_logical.GetBackupConfigService())
 })

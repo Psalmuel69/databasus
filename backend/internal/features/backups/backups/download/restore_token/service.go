@@ -1,14 +1,15 @@
 package restore_token
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/valkey-io/valkey-go"
 
 	"databasus-backend/internal/features/backups/backups/download/stream_guard"
+	"databasus-backend/internal/util/cache"
 )
 
 // Service issues and consumes single-use tokens authorizing a physical restore
@@ -21,10 +22,10 @@ type Service struct {
 	logger *slog.Logger
 }
 
-func NewService(guard *stream_guard.Guard, client valkey.Client, logger *slog.Logger) *Service {
+func NewService(guard *stream_guard.Guard, cacheStore cache.Store, logger *slog.Logger) *Service {
 	return &Service{
 		guard,
-		newStore(client),
+		newStore(cacheStore),
 		logger,
 	}
 }
@@ -32,22 +33,25 @@ func NewService(guard *stream_guard.Guard, client valkey.Client, logger *slog.Lo
 // GenerateRestoreToken issues a single-use, short-TTL token authorizing a
 // physical restore stream of databaseID to targetTime (nil ⇒ latest).
 func (s *Service) GenerateRestoreToken(
+	ctx context.Context,
 	databaseID, userID uuid.UUID,
 	targetTime *time.Time,
 ) (string, error) {
-	if s.IsDownloadInProgress(userID) {
+	if s.IsDownloadInProgress(ctx, userID) {
 		return "", stream_guard.ErrDownloadAlreadyInProgress
 	}
 
 	token := stream_guard.GenerateSecureToken()
 
-	s.store.issue(token, &Token{
+	if err := s.store.issue(ctx, token, Token{
 		DatabaseID: databaseID,
 		UserID:     userID,
 		TargetTime: targetTime,
-	})
+	}); err != nil {
+		return "", err
+	}
 
-	s.logger.Info("generated restore token", "database_id", databaseID, "user_id", userID)
+	s.logger.InfoContext(ctx, "generated restore token", "database_id", databaseID, "user_id", userID)
 
 	return token, nil
 }
@@ -56,21 +60,24 @@ func (s *Service) GenerateRestoreToken(
 // per-backup restore stream (the FULL plus its incremental ancestors, no WAL)
 // of backupID within databaseID.
 func (s *Service) GenerateBackupRestoreToken(
+	ctx context.Context,
 	databaseID, userID, backupID uuid.UUID,
 ) (string, error) {
-	if s.IsDownloadInProgress(userID) {
+	if s.IsDownloadInProgress(ctx, userID) {
 		return "", stream_guard.ErrDownloadAlreadyInProgress
 	}
 
 	token := stream_guard.GenerateSecureToken()
 
-	s.store.issue(token, &Token{
+	if err := s.store.issue(ctx, token, Token{
 		DatabaseID: databaseID,
 		UserID:     userID,
 		BackupID:   &backupID,
-	})
+	}); err != nil {
+		return "", err
+	}
 
-	s.logger.Info("generated backup restore token",
+	s.logger.InfoContext(ctx, "generated backup restore token",
 		"database_id", databaseID, "user_id", userID, "backup_id", backupID)
 
 	return token, nil
@@ -87,18 +94,22 @@ func (s *Service) GenerateBackupRestoreToken(
 // and burning the token beats a validate-then-consume window that two requests
 // could both pass.
 func (s *Service) ValidateAndConsumeRestoreToken(
+	ctx context.Context,
 	token string,
 ) (*Token, error) {
-	restoreToken := s.store.consume(token)
+	restoreToken, err := s.store.consume(ctx, token)
+	if err != nil {
+		return nil, err
+	}
 	if restoreToken == nil {
 		return nil, errors.New("invalid or expired restore token")
 	}
 
-	if err := s.AcquireSlot(restoreToken.UserID); err != nil {
+	if err := s.AcquireSlot(ctx, restoreToken.UserID); err != nil {
 		return nil, err
 	}
 
-	s.logger.Info("restore token validated and consumed",
+	s.logger.InfoContext(ctx, "restore token validated and consumed",
 		"database_id", restoreToken.DatabaseID, "user_id", restoreToken.UserID)
 
 	return restoreToken, nil

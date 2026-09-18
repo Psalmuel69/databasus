@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"context"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,12 +16,13 @@ import (
 )
 
 type DatabaseEntry struct {
-	Type         string                     `json:"type"`
-	Version      string                     `json:"version"`
-	BackupType   string                     `json:"backupType,omitzero"`
-	RawSizeMb    int64                      `json:"rawSizeMb,omitzero"`
-	BackupSizeMb int64                      `json:"backupSizeMb,omitzero"`
-	Verification *DatabaseVerificationEntry `json:"verification,omitempty"`
+	Type               string                     `json:"type"`
+	Version            string                     `json:"version"`
+	BackupType         string                     `json:"backupType,omitzero"`
+	IsSshTunnelEnabled bool                       `json:"isSshTunnelEnabled"`
+	RawSizeMb          int64                      `json:"rawSizeMb,omitzero"`
+	BackupSizeMb       int64                      `json:"backupSizeMb,omitzero"`
+	Verification       *DatabaseVerificationEntry `json:"verification,omitempty"`
 }
 
 type DatabaseVerificationEntry struct {
@@ -76,7 +78,7 @@ type userCounter interface {
 }
 
 type verificationAgentLister interface {
-	ListAgents() ([]*verification_agents.Agent, error)
+	ListAgents(ctx context.Context) ([]*verification_agents.Agent, error)
 }
 
 type verificationConfigLister interface {

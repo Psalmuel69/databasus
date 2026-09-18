@@ -33,9 +33,11 @@ clean-testcontainers:
 	if [ -n "$$ids" ]; then docker rm -f $$ids; else echo "no leftover testcontainers"; fi
 
 pull-testcontainers:
-	# Tag must start with a digit so a quoted "postgres:postgres" chown arg in physical
-	# tests isn't mistaken for an image tag; every real image tag here is version-like.
-	@grep -rhoE '"(mysql|mariadb|mongo|postgres):[0-9][a-zA-Z0-9._-]*"' ./internal \
+	# For the bare names the tag must start with a digit, so a quoted "postgres:postgres"
+	# chown arg in physical tests isn't mistaken for an image tag; every real image tag
+	# there is version-like. A registry-qualified name cannot be confused with anything,
+	# so its tag is matched as written.
+	@grep -rhoE '"(mysql|mariadb|mongo|postgres):[0-9][a-zA-Z0-9._-]*"|"quay\.io/minio/minio:[a-zA-Z0-9._-]+"' ./internal \
 		| tr -d '"' | sort -u \
 		| xargs -P 4 -I {} sh -c 'for n in 1 2 3; do docker pull {} && exit 0; echo "retry {} ($$n)"; sleep 3; done; echo "FAILED to pull {} after 3 attempts"; exit 1'
 

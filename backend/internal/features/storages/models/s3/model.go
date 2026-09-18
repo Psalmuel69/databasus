@@ -33,6 +33,11 @@ const (
 	s3TLSHandshakeTimeout = 30 * time.Second
 	s3DeleteTimeout       = 30 * time.Second
 
+	s3ConnectionTestTimeout = 10 * time.Second
+
+	connectionTestObjectName    = "databasus-connection-test"
+	connectionTestObjectContent = "databasus connection test"
+
 	// defaultInnerPartSize is the multipart part we feed S3 for one object. 16 MiB balances
 	// memory against request count and creates backpressure to pg_dump: we keep one part in
 	// flight and wait for S3 to confirm it before reading the next, so pipeline memory does not
@@ -48,7 +53,12 @@ const (
 	defaultMaxPartsPerObject = 1000
 
 	manifestSuffix  = ".parts"
+	partSuffix      = ".part"
+	partIndexDigits = 6
 	manifestVersion = 1
+
+	s3ErrCodeNoSuchBucket = "NoSuchBucket"
+	s3ErrCodeAccessDenied = "AccessDenied"
 )
 
 type S3Storage struct {
@@ -90,11 +100,18 @@ func (s *S3Storage) SaveFile(
 
 	client, err := s.getClient(encryptor)
 	if err != nil {
+		logger.ErrorContext(ctx, "failed to build the s3 client", "bucket", s.S3Bucket, "error", err)
+
 		return err
 	}
 
 	baseKey := s.buildObjectKey(fileName)
 	innerPartSize := s.innerPartSize()
+
+	startedAt := time.Now().UTC()
+
+	logger.DebugContext(ctx, "saving file to s3", "file_name", fileName,
+		"bucket", s.S3Bucket, "object_key", baseKey)
 
 	// Look ahead by one inner part to choose the layout. A stream that fits in a single inner part
 	// (WAL segments, .metadata/.manifest sidecars, small dumps, empty files) is written as one
@@ -107,7 +124,20 @@ func (s *S3Storage) SaveFile(
 	}
 
 	if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
-		return s.uploadSingleObject(ctx, client, baseKey, firstPart[:firstPartLen])
+		if err := s.uploadSingleObject(ctx, client, baseKey, firstPart[:firstPartLen]); err != nil {
+			logger.ErrorContext(ctx, "failed to save file to s3", "file_name", fileName,
+				"object_key", baseKey, "error", err)
+
+			return err
+		}
+
+		reportSaveToS3(
+			ctx,
+			logger,
+			savedObject{FileName: fileName, ObjectKey: baseKey, SizeBytes: int64(firstPartLen), StartedAt: startedAt},
+		)
+
+		return nil
 	}
 
 	// The first part filled exactly: peek one more byte to tell "stream is exactly one inner part"
@@ -119,68 +149,120 @@ func (s *S3Storage) SaveFile(
 	}
 
 	if peekLen == 0 {
-		return s.uploadSingleObject(ctx, client, baseKey, firstPart)
+		if err := s.uploadSingleObject(ctx, client, baseKey, firstPart); err != nil {
+			logger.ErrorContext(ctx, "failed to save file to s3", "file_name", fileName,
+				"object_key", baseKey, "error", err)
+
+			return err
+		}
+
+		reportSaveToS3(
+			ctx,
+			logger,
+			savedObject{FileName: fileName, ObjectKey: baseKey, SizeBytes: int64(len(firstPart)), StartedAt: startedAt},
+		)
+
+		return nil
 	}
 
 	coreClient, err := s.getCoreClient(encryptor)
 	if err != nil {
+		logger.ErrorContext(ctx, "failed to build the s3 core client", "bucket", s.S3Bucket, "error", err)
+
 		return err
 	}
 
 	source := io.MultiReader(bytes.NewReader(firstPart), bytes.NewReader(peek[:peekLen]), file)
 
-	return s.uploadChunked(ctx, coreClient, client, baseKey, source)
+	logger.DebugContext(ctx, "stream exceeds one part, saving to s3 as a chunked object",
+		"file_name", fileName, "object_key", baseKey)
+
+	if err := s.uploadChunked(ctx, coreClient, client, baseKey, source); err != nil {
+		logger.ErrorContext(ctx, "failed to save chunked file to s3", "file_name", fileName,
+			"object_key", baseKey, "error", err)
+
+		return err
+	}
+
+	logger.DebugContext(ctx, fmt.Sprintf("saved chunked file to s3 in %s", time.Since(startedAt)),
+		"file_name", fileName, "object_key", baseKey)
+
+	return nil
+}
+
+type savedObject struct {
+	FileName  string
+	ObjectKey string
+	SizeBytes int64
+	StartedAt time.Time
+}
+
+func reportSaveToS3(ctx context.Context, logger *slog.Logger, saved savedObject) {
+	logger.DebugContext(ctx, fmt.Sprintf("saved file to s3: %.2f MB in %s",
+		float64(saved.SizeBytes)/(1024*1024), time.Since(saved.StartedAt)),
+		"file_name", saved.FileName, "object_key", saved.ObjectKey)
 }
 
 func (s *S3Storage) GetFile(
+	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
+	logger *slog.Logger,
 	fileName string,
 ) (io.ReadCloser, error) {
-	client, err := s.getClient(encryptor)
+	coreClient, err := s.getCoreClient(encryptor)
 	if err != nil {
+		logger.ErrorContext(ctx, "failed to build the s3 core client", "bucket", s.S3Bucket, "error", err)
+
 		return nil, err
 	}
 
 	baseKey := s.buildObjectKey(fileName)
 
-	manifest, hasManifest, err := s.readManifest(context.TODO(), client, baseKey)
+	logger.DebugContext(ctx, "reading file from s3", "file_name", fileName, "object_key", baseKey)
+
+	manifest, hasManifest, err := s.readManifest(ctx, coreClient.Client, baseKey)
 	if err != nil {
 		return nil, err
 	}
 
 	if hasManifest {
-		return newReassemblingReader(client, s.S3Bucket, manifest.Parts), nil
+		return newReassemblingReader(reassemblingReaderSpec{
+			streamCtx:           ctx,
+			logger:              logger,
+			coreClient:          coreClient,
+			bucket:              s.S3Bucket,
+			parts:               manifest.Parts,
+			hasManifestChecksum: true,
+		}), nil
 	}
 
-	object, err := client.GetObject(
-		context.TODO(),
-		s.S3Bucket,
-		baseKey,
-		minio.GetObjectOptions{},
-	)
+	objectInfo, err := coreClient.StatObject(ctx, s.S3Bucket, baseKey, minio.StatObjectOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get file from S3: %w", err)
+		if minio.ToErrorResponse(err).StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("file does not exist in S3: %w", err)
+		}
+
+		return nil, fmt.Errorf("failed to stat file in S3: %w", err)
 	}
 
-	// Check if the file actually exists by reading the first byte
-	buf := make([]byte, 1)
-	_, readErr := object.Read(buf)
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		_ = object.Close()
-		return nil, fmt.Errorf("file does not exist in S3: %w", readErr)
-	}
-
-	// Reset the reader to the beginning
-	_, seekErr := object.Seek(0, io.SeekStart)
-	if seekErr != nil {
-		_ = object.Close()
-		return nil, fmt.Errorf("failed to reset file reader: %w", seekErr)
-	}
-
-	return object, nil
+	return newReassemblingReader(reassemblingReaderSpec{
+		streamCtx:  ctx,
+		logger:     logger,
+		coreClient: coreClient,
+		bucket:     s.S3Bucket,
+		parts:      []objectSpan{{Key: baseKey, Size: objectInfo.Size}},
+	}), nil
 }
 
-func (s *S3Storage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
+// Chunks are found by listing rather than only through the manifest, because a
+// write can complete numbered objects before it publishes one. The multipart abort
+// matters too: an interrupted upload keeps consuming storage until it is aborted.
+func (s *S3Storage) DeleteFile(
+	ctx context.Context,
+	encryptor encryption.FieldEncryptor,
+	logger *slog.Logger,
+	fileName string,
+) error {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return err
@@ -188,37 +270,35 @@ func (s *S3Storage) DeleteFile(encryptor encryption.FieldEncryptor, fileName str
 
 	baseKey := s.buildObjectKey(fileName)
 
-	ctx, cancel := context.WithTimeout(context.Background(), s3DeleteTimeout)
+	// Deletes run from cleanup paths whose caller context is often already cancelled, so the
+	// operation carries its own deadline; the caller's ctx stays for log correlation only.
+	deleteCtx, cancel := context.WithTimeout(context.Background(), s3DeleteTimeout)
 	defer cancel()
 
-	manifest, hasManifest, err := s.readManifest(ctx, client, baseKey)
+	keys, err := s.derivedObjectKeys(deleteCtx, client, baseKey)
 	if err != nil {
+		logger.WarnContext(ctx, "failed to discover s3 objects to delete",
+			"file_name", fileName, "object_key", baseKey, "error", err)
+
 		return err
 	}
 
-	if hasManifest {
-		keys := make([]string, 0, len(manifest.Parts)+1)
-		for _, part := range manifest.Parts {
-			keys = append(keys, part.Key)
-		}
-		keys = append(keys, manifestObjectKey(baseKey))
+	if err := s.removeObjects(deleteCtx, client, keys); err != nil {
+		logger.WarnContext(ctx, "failed to delete file from s3",
+			"file_name", fileName, "object_key", baseKey, "error", err)
 
-		if err := s.removeObjects(ctx, client, keys); err != nil {
-			return fmt.Errorf("failed to delete chunked backup from S3: %w", err)
-		}
-
-		return nil
-	}
-
-	err = client.RemoveObject(
-		ctx,
-		s.S3Bucket,
-		baseKey,
-		minio.RemoveObjectOptions{},
-	)
-	if err != nil {
 		return fmt.Errorf("failed to delete file from S3: %w", err)
 	}
+
+	if err := s.abortDerivedMultipartUploads(deleteCtx, encryptor, client, baseKey); err != nil {
+		logger.WarnContext(ctx, "failed to abort incomplete s3 uploads",
+			"file_name", fileName, "object_key", baseKey, "error", err)
+
+		return err
+	}
+
+	logger.DebugContext(ctx, fmt.Sprintf("deleted file from s3 (%d objects)", len(keys)),
+		"file_name", fileName, "object_key", baseKey)
 
 	return nil
 }
@@ -237,61 +317,27 @@ func (s *S3Storage) Validate(encryptor encryption.FieldEncryptor) error {
 	return nil
 }
 
+// A backup credential may be scoped to the configured prefix and denied deletes on purpose, so the
+// probe stays on a single key inside the prefix and never lets a refused delete fail the storage:
+// writing and reading back is everything a backup needs from S3.
 func (s *S3Storage) TestConnection(encryptor encryption.FieldEncryptor) error {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return err
 	}
 
-	// Create a context with 10 second timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	probeKey := s.buildObjectKey(connectionTestObjectName)
+	probeContent := []byte(connectionTestObjectContent)
 
-	// Check if the bucket exists to verify connection
-	exists, err := client.BucketExists(ctx, s.S3Bucket)
-	if err != nil {
-		// Check if the error is due to context deadline exceeded
-		if errors.Is(err, context.DeadlineExceeded) {
-			return errors.New("failed to connect to the bucket. Please check params")
-		}
-		return fmt.Errorf("failed to connect to S3: %w", err)
+	if err := s.writeConnectionProbe(client, probeKey, probeContent); err != nil {
+		return err
 	}
 
-	if !exists {
-		return fmt.Errorf("bucket '%s' does not exist", s.S3Bucket)
+	if err := s.readAndVerifyConnectionProbe(client, probeKey, probeContent); err != nil {
+		return err
 	}
 
-	// Test write and delete permissions by uploading and removing a small test file
-	testFileID := uuid.New().String() + "-test"
-	testObjectKey := s.buildObjectKey(testFileID)
-	testData := []byte("test connection")
-	testReader := bytes.NewReader(testData)
-
-	// Upload test file
-	_, err = client.PutObject(
-		ctx,
-		s.S3Bucket,
-		testObjectKey,
-		testReader,
-		int64(len(testData)),
-		minio.PutObjectOptions{
-			SendContentMd5: true,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to upload test file to S3: %w", err)
-	}
-
-	// Delete test file
-	err = client.RemoveObject(
-		ctx,
-		s.S3Bucket,
-		testObjectKey,
-		minio.RemoveObjectOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to delete test file from S3: %w", err)
-	}
+	_ = s.deleteConnectionProbe(client, probeKey)
 
 	return nil
 }
@@ -341,6 +387,172 @@ func (s *S3Storage) Update(incoming *S3Storage) {
 	// otherwise we will have to transfer all the data to the new prefix
 }
 
+// Listing matches the exact derived grammar, so deleting "backup-1" cannot reach
+// "backup-10". The manifest key is removed unconditionally, so no caller may name a
+// sidecar "<base>.parts".
+func (s *S3Storage) derivedObjectKeys(
+	ctx context.Context,
+	client *minio.Client,
+	baseKey string,
+) ([]string, error) {
+	keys := []string{baseKey, manifestObjectKey(baseKey)}
+
+	manifest, hasManifest, err := s.readManifest(ctx, client, baseKey)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[string]struct{}{keys[0]: {}, keys[1]: {}}
+
+	if hasManifest {
+		for _, part := range manifest.Parts {
+			if _, duplicate := seen[part.Key]; duplicate {
+				continue
+			}
+
+			seen[part.Key] = struct{}{}
+			keys = append(keys, part.Key)
+		}
+	}
+
+	for object := range client.ListObjects(ctx, s.S3Bucket, minio.ListObjectsOptions{
+		Prefix:    baseKey + partSuffix,
+		Recursive: true,
+	}) {
+		if object.Err != nil {
+			return nil, fmt.Errorf("failed to list chunk objects: %w", object.Err)
+		}
+
+		if !isPartObjectKey(baseKey, object.Key) {
+			continue
+		}
+
+		if _, duplicate := seen[object.Key]; duplicate {
+			continue
+		}
+
+		seen[object.Key] = struct{}{}
+		keys = append(keys, object.Key)
+	}
+
+	return keys, nil
+}
+
+func (s *S3Storage) abortDerivedMultipartUploads(
+	ctx context.Context,
+	encryptor encryption.FieldEncryptor,
+	client *minio.Client,
+	baseKey string,
+) error {
+	coreClient, err := s.getCoreClient(encryptor)
+	if err != nil {
+		return err
+	}
+
+	for upload := range client.ListIncompleteUploads(ctx, s.S3Bucket, baseKey, true) {
+		if upload.Err != nil {
+			return fmt.Errorf("failed to list incomplete uploads: %w", upload.Err)
+		}
+
+		if upload.Key != baseKey && !isPartObjectKey(baseKey, upload.Key) {
+			continue
+		}
+
+		if err := coreClient.AbortMultipartUpload(ctx, s.S3Bucket, upload.Key, upload.UploadID); err != nil {
+			return fmt.Errorf("failed to abort incomplete upload for %s: %w", upload.Key, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *S3Storage) writeConnectionProbe(
+	client *minio.Client,
+	objectKey string,
+	content []byte,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s3ConnectionTestTimeout)
+	defer cancel()
+
+	// The probe carries the configured storage class so a policy that constrains
+	// s3:x-amz-storage-class accepts or rejects it exactly as it would a real backup.
+	options := s.putObjectOptions()
+	options.SendContentMd5 = true
+
+	_, err := client.PutObject(
+		ctx,
+		s.S3Bucket,
+		objectKey,
+		bytes.NewReader(content),
+		int64(len(content)),
+		options,
+	)
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("failed to connect to the bucket. Please check params")
+	}
+
+	switch minio.ToErrorResponse(err).Code {
+	case s3ErrCodeNoSuchBucket:
+		return fmt.Errorf("bucket '%s' does not exist", s.S3Bucket)
+	case s3ErrCodeAccessDenied:
+		return fmt.Errorf("credentials cannot write to '%s' in bucket '%s'", objectKey, s.S3Bucket)
+	}
+
+	return fmt.Errorf("failed to upload test file to S3: %w", err)
+}
+
+func (s *S3Storage) readAndVerifyConnectionProbe(
+	client *minio.Client,
+	objectKey string,
+	writtenContent []byte,
+) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s3ConnectionTestTimeout)
+	defer cancel()
+
+	object, err := client.GetObject(ctx, s.S3Bucket, objectKey, minio.GetObjectOptions{})
+	if err != nil {
+		return s.describeConnectionProbeReadError(err, objectKey)
+	}
+
+	defer func() {
+		_ = object.Close()
+	}()
+
+	storedContent, err := io.ReadAll(object)
+	if err != nil {
+		return s.describeConnectionProbeReadError(err, objectKey)
+	}
+
+	if !bytes.Equal(storedContent, writtenContent) {
+		return fmt.Errorf("storage returned different content than was written to '%s'", objectKey)
+	}
+
+	return nil
+}
+
+func (s *S3Storage) describeConnectionProbeReadError(err error, objectKey string) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("failed to connect to the bucket. Please check params")
+	}
+
+	if minio.ToErrorResponse(err).Code == s3ErrCodeAccessDenied {
+		return fmt.Errorf("credentials cannot read back from '%s', so restores would fail", objectKey)
+	}
+
+	return fmt.Errorf("failed to read test file from S3: %w", err)
+}
+
+func (s *S3Storage) deleteConnectionProbe(client *minio.Client, objectKey string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s3ConnectionTestTimeout)
+	defer cancel()
+
+	return client.RemoveObject(ctx, s.S3Bucket, objectKey, minio.RemoveObjectOptions{})
+}
+
 func (s *S3Storage) innerPartSize() int {
 	if s.innerPartSizeOverride > 0 {
 		return s.innerPartSizeOverride
@@ -385,7 +597,7 @@ func (s *S3Storage) uploadChunked(
 	maxParts := s.maxPartsPerObject()
 	buf := make([]byte, innerPartSize)
 
-	var manifestParts []manifestPart
+	var objectSpans []objectSpan
 	var uploadedKeys []string
 	var totalSize int64
 
@@ -483,7 +695,7 @@ func (s *S3Storage) uploadChunked(
 		}
 
 		uploadedKeys = append(uploadedKeys, objectKey)
-		manifestParts = append(manifestParts, manifestPart{
+		objectSpans = append(objectSpans, objectSpan{
 			Key:    objectKey,
 			Size:   objectSize,
 			SHA256: hex.EncodeToString(objectHasher.Sum(nil)),
@@ -495,7 +707,7 @@ func (s *S3Storage) uploadChunked(
 	manifest := chunkedManifest{
 		Version:   manifestVersion,
 		TotalSize: totalSize,
-		Parts:     manifestParts,
+		Parts:     objectSpans,
 	}
 
 	if err := s.writeManifest(ctx, client, baseKey, manifest); err != nil {
@@ -672,19 +884,37 @@ func (s *S3Storage) getClientParams(
 //  3. It immunizes reads against S3 eventual consistency: a transient 404 on a middle part can no
 //     longer be misread as the end of the stream.
 type chunkedManifest struct {
-	Version   int            `json:"version"`
-	TotalSize int64          `json:"totalSize"`
-	Parts     []manifestPart `json:"parts"`
+	Version   int          `json:"version"`
+	TotalSize int64        `json:"totalSize"`
+	Parts     []objectSpan `json:"parts"`
 }
 
-type manifestPart struct {
+// objectSpan is one stored object with the length and sha256 a read must verify it against. The
+// manifest lists them for a chunked file; a file stored before chunking is described by a single
+// span with no recorded checksum.
+type objectSpan struct {
 	Key    string `json:"key"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
 }
 
 func partObjectKey(baseKey string, objectIndex int) string {
-	return fmt.Sprintf("%s.part%06d", baseKey, objectIndex)
+	return fmt.Sprintf("%s%s%0*d", baseKey, partSuffix, partIndexDigits, objectIndex)
+}
+
+func isPartObjectKey(baseKey, candidate string) bool {
+	index, found := strings.CutPrefix(candidate, baseKey+partSuffix)
+	if !found || len(index) != partIndexDigits {
+		return false
+	}
+
+	for _, digit := range index {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+
+	return true
 }
 
 func manifestObjectKey(baseKey string) string {
@@ -772,96 +1002,4 @@ func (s *S3Storage) removeObjects(ctx context.Context, client *minio.Client, key
 	}
 
 	return firstErr
-}
-
-// reassemblingReader streams a chunked backup back as one byte stream by opening each part object
-// in manifest order, reading it to EOF and only then opening the next. It holds at most one part
-// connection at a time, preserving the bounded-memory streaming of the upload path (ADR-0004), and
-// verifies each part's length and sha256 against the manifest so a missing, truncated, or corrupted
-// part surfaces as a read error instead of a silently short stream.
-type reassemblingReader struct {
-	client  *minio.Client
-	bucket  string
-	parts   []manifestPart
-	index   int
-	current *minio.Object
-	hasher  hash.Hash
-	read    int64
-}
-
-func newReassemblingReader(client *minio.Client, bucket string, parts []manifestPart) *reassemblingReader {
-	return &reassemblingReader{client: client, bucket: bucket, parts: parts}
-}
-
-func (r *reassemblingReader) Read(p []byte) (int, error) {
-	for {
-		if r.current == nil {
-			if r.index >= len(r.parts) {
-				return 0, io.EOF
-			}
-
-			object, err := r.client.GetObject(context.TODO(), r.bucket, r.parts[r.index].Key, minio.GetObjectOptions{})
-			if err != nil {
-				return 0, fmt.Errorf("failed to open chunk %s: %w", r.parts[r.index].Key, err)
-			}
-
-			r.current = object
-			r.hasher = sha256.New()
-			r.read = 0
-		}
-
-		n, err := r.current.Read(p)
-		if n > 0 {
-			r.hasher.Write(p[:n])
-			r.read += int64(n)
-		}
-
-		if errors.Is(err, io.EOF) {
-			if verifyErr := r.finishCurrentPart(); verifyErr != nil {
-				return n, verifyErr
-			}
-
-			if n > 0 {
-				return n, nil
-			}
-
-			continue
-		}
-
-		if err != nil {
-			return n, fmt.Errorf("failed to read chunk %s: %w", r.parts[r.index].Key, err)
-		}
-
-		return n, nil
-	}
-}
-
-func (r *reassemblingReader) Close() error {
-	if r.current == nil {
-		return nil
-	}
-
-	err := r.current.Close()
-	r.current = nil
-
-	return err
-}
-
-func (r *reassemblingReader) finishCurrentPart() error {
-	part := r.parts[r.index]
-
-	_ = r.current.Close()
-	r.current = nil
-
-	if r.read != part.Size {
-		return fmt.Errorf("chunk %s size mismatch: manifest %d, read %d", part.Key, part.Size, r.read)
-	}
-
-	if checksum := hex.EncodeToString(r.hasher.Sum(nil)); checksum != part.SHA256 {
-		return fmt.Errorf("chunk %s checksum mismatch", part.Key)
-	}
-
-	r.index++
-
-	return nil
 }

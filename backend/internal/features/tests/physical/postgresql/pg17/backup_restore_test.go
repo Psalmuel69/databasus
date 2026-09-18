@@ -27,8 +27,16 @@ func Test_PhysicalRestore_WhenWalGapBeforeTarget_TokenRequestReturns422(t *testi
 	physicaltesting.RunWhenWalGapBeforeTargetTokenRequestReturns422(t, pgVersion, pgImage)
 }
 
+func Test_PhysicalRestore_WhenOrphanSweepRunsAfterFull_TargetPastFullStaysRestorable(t *testing.T) {
+	physicaltesting.RunWhenOrphanSweepRunsAfterFullTargetPastFullStaysRestorable(t, pgVersion, pgImage)
+}
+
 func Test_PhysicalWalStream_OnTimelineSwitch_CatalogsHistoryOnParentDatabaseID(t *testing.T) {
 	physicaltesting.RunWalStreamCatalogsHistoryOnTimelineSwitch(t, pgVersion, pgImage)
+}
+
+func Test_PhysicalBackup_AfterPromotion_ReanchorsIncrementalChain(t *testing.T) {
+	physicaltesting.RunPromotionReanchorsIncrementalChain(t, pgVersion, pgImage)
 }
 
 func Test_PhysicalRestore_BootViaEntrypointVolumeMount_RecoversBaseRows(t *testing.T) {
@@ -49,4 +57,12 @@ func Test_PhysicalWalSlot_AppearsWhenBackupingStarts_RemovedWhenDatabaseDeleted(
 
 func Test_PhysicalWalSlot_WhenDatabaseDeletedWithStreamedWal_SlotRemovedSoNoWalStuck(t *testing.T) {
 	physicaltesting.RunWalSlotWhenDatabaseDeletedWithStreamedWalSlotRemovedSoNoWalStuck(t, pgVersion, pgImage)
+}
+
+func Test_PhysicalRestore_OverSshTunnel_RecoversToTarget(t *testing.T) {
+	physicaltesting.RunOverSshTunnelRecoversToTarget(t, pgVersion, pgImage)
+}
+
+func Test_PhysicalWalStream_WhenTheBastionDiesMidStream_KeepsTheSlotAndResumes(t *testing.T) {
+	physicaltesting.RunWhenBastionDiesMidStreamKeepsTheSlotAndResumes(t, pgVersion, pgImage)
 }

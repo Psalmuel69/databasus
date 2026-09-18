@@ -24,7 +24,7 @@ import (
 	backups_core_enums "databasus-backend/internal/features/backups/backups/core/enums"
 	physical_enums "databasus-backend/internal/features/backups/backups/core/physical/enums"
 	backup_encryption "databasus-backend/internal/features/backups/backups/encryption"
-	"databasus-backend/internal/features/storages"
+	storage_files "databasus-backend/internal/features/storages/files"
 	"databasus-backend/internal/util/encryption"
 )
 
@@ -84,7 +84,12 @@ func (f *fakeStorageFileSaver) deadlineFor(fileName string) (time.Time, bool) {
 	return deadline, hasDeadline
 }
 
-func (f *fakeStorageFileSaver) GetFile(_ encryption.FieldEncryptor, fileName string) (io.ReadCloser, error) {
+func (f *fakeStorageFileSaver) GetFile(
+	_ context.Context,
+	_ encryption.FieldEncryptor,
+	_ *slog.Logger,
+	fileName string,
+) (io.ReadCloser, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -105,18 +110,36 @@ func (f *fakeStorageFileSaver) has(fileName string) bool {
 	return ok
 }
 
-func (f *fakeStorageFileSaver) DeleteFile(encryption.FieldEncryptor, string) error   { return nil }
-func (f *fakeStorageFileSaver) Validate(encryption.FieldEncryptor) error             { return nil }
-func (f *fakeStorageFileSaver) TestConnection(encryption.FieldEncryptor) error       { return nil }
+func (f *fakeStorageFileSaver) DeleteFile(context.Context, encryption.FieldEncryptor, *slog.Logger, string) error {
+	return nil
+}
+func (f *fakeStorageFileSaver) Validate(encryption.FieldEncryptor) error       { return nil }
+func (f *fakeStorageFileSaver) TestConnection(encryption.FieldEncryptor) error { return nil }
+
+// The physical stream writes through the file store, and the fake records what it
+// receives so the deadline and payload assertions have something to read.
+func (f *fakeStorageFileSaver) WriteFile(
+	ctx context.Context,
+	reference storage_files.StoredFileReference,
+	file io.Reader,
+) (storage_files.WriteReceipt, error) {
+	if err := f.SaveFile(ctx, nil, nil, reference.FileName, file); err != nil {
+		return storage_files.WriteReceipt{}, err
+	}
+
+	return storage_files.WriteReceipt{PendingDeletionID: uuid.New(), Reference: reference}, nil
+}
+
 func (f *fakeStorageFileSaver) HideSensitiveData()                                   {}
 func (f *fakeStorageFileSaver) EncryptSensitiveData(encryption.FieldEncryptor) error { return nil }
 
 func testRunStreamParams(
-	storage storages.StorageFileSaver,
+	storage *fakeStorageFileSaver,
 	codec physical_enums.PhysicalBackupCompression,
 ) runStreamParams {
 	return runStreamParams{
-		Storage:        storage,
+		FileStore:      storage,
+		StorageID:      uuid.New(),
 		FieldEncryptor: nil,
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		FileName:       "test-obj",
@@ -259,6 +282,26 @@ func Test_RunStream_WhenStorageSaveFails_ReturnsStorageUploadFailedNotStall(t *t
 		"a storage failure that cancels the stream must not be reported as a network stall")
 }
 
+// runStream sits below the layer that owns cleanup, so what it guarantees is that a
+// failed attempt hands back nothing to publish. The bytes it already uploaded are
+// removed by the worker, which the use-case tests cover against a real store.
+func Test_RunStream_WhenPgBasebackupWritesBytesThenFails_LeavesNoReceiptToPublish(t *testing.T) {
+	storage := newFakeStorage()
+
+	outcome, err := runStream(
+		t.Context(),
+		testRunStreamParams(storage, physical_enums.PhysicalBackupCompressionNone),
+		shellBuildCmd(`printf 'partial physical backup'; exit 1`),
+		classifyFullStreamError,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, outcome.ErrorReason)
+	assert.Equal(t, physical_enums.PhysicalBackupStatusError, outcome.Status)
+	assert.Equal(t, physical_enums.PhysicalBackupErrorPgBasebackupFailed, *outcome.ErrorReason)
+	assert.Equal(t, []byte("partial physical backup"), storage.saved["test-obj"])
+	assert.Empty(t, outcome.Receipts, "a failed attempt must leave its bytes for cleanup, not for publication")
+}
+
 func Test_RunStream_WhenManifestWalkFails_ReturnsManifestCorrupted(t *testing.T) {
 	// 1 KB of non-tar bytes: pg exits clean, but the walk hits a bad tar header
 	// (not a truncation), so the manifest goroutine flags genuine corruption.
@@ -275,9 +318,15 @@ func Test_RunStream_WhenManifestWalkFails_ReturnsManifestCorrupted(t *testing.T)
 func Test_RunStream_WhenCompressionUnsupported_ReturnsRetrySignal(t *testing.T) {
 	storage := newFakeStorage()
 
-	outcome, err := runStream(t.Context(), testRunStreamParams(storage, physical_enums.PhysicalBackupCompressionZstd),
-		shellBuildCmd(`echo "pg_basebackup: error: zstd compression is not supported by this build" >&2; exit 1`),
-		classifyFullStreamError)
+	outcome, err := runStream(
+		t.Context(),
+		testRunStreamParams(storage, physical_enums.PhysicalBackupCompressionZstd),
+		shellBuildCmd(
+			`echo "pg_basebackup: error: could not initiate base backup: ERROR:  invalid compression specification: `+
+				`this build does not support compression with ZSTD" >&2; exit 1`,
+		),
+		classifyFullStreamError,
+	)
 	require.NoError(t, err)
 
 	assert.True(t, outcome.isCompressionUnsupported,
@@ -311,17 +360,20 @@ func Test_SaveManifestSidecar_WhenEncrypted_RoundTripsWithOwnSaltIV(t *testing.T
 	manifest := []byte(`{ "PostgreSQL-Backup-Manifest-Version": 2, "System-Identifier": 42 }`)
 
 	params := runStreamParams{
-		Storage:    storage,
+		FileStore:  storage,
+		StorageID:  uuid.New(),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MasterKey:  masterKey,
 		Encryption: backups_core_enums.BackupEncryptionEncrypted,
 		BackupID:   backupID,
 	}
 
-	saltB64, nonceB64, err := saveManifestSidecar(t.Context(), params, "obj.manifest", manifest)
+	sidecar, err := saveManifestSidecar(t.Context(), params, "obj.manifest", manifest)
 	require.NoError(t, err)
-	require.NotEmpty(t, saltB64)
-	require.NotEmpty(t, nonceB64)
+	require.NotEmpty(t, sidecar.SaltBase64)
+	require.NotEmpty(t, sidecar.NonceBase64)
+
+	saltB64, nonceB64 := sidecar.SaltBase64, sidecar.NonceBase64
 
 	stored := storage.saved["obj.manifest"]
 	require.NotEqual(t, manifest, stored, "stored sidecar must be ciphertext")
@@ -362,7 +414,7 @@ func Test_SaveManifestSidecar_WhenManifestIsSmall_UsesFloorDeadline(t *testing.T
 	storage := newFakeStorage()
 	params := testRunStreamParams(storage, physical_enums.PhysicalBackupCompressionNone)
 
-	_, _, err := saveManifestSidecar(t.Context(), params, "obj.manifest", []byte(`{ "Files": [] }`))
+	_, err := saveManifestSidecar(t.Context(), params, "obj.manifest", []byte(`{ "Files": [] }`))
 	require.NoError(t, err)
 
 	deadline, hasDeadline := storage.deadlineFor("obj.manifest")
@@ -380,7 +432,7 @@ func Test_SaveManifestSidecar_WhenManifestIsLarge_ExtendsDeadlineBeyondFloor(t *
 	params := testRunStreamParams(storage, physical_enums.PhysicalBackupCompressionNone)
 	largeManifest := bytes.Repeat([]byte("m"), 40*1024*1024)
 
-	_, _, err := saveManifestSidecar(t.Context(), params, "obj.manifest", largeManifest)
+	_, err := saveManifestSidecar(t.Context(), params, "obj.manifest", largeManifest)
 	require.NoError(t, err)
 
 	deadline, hasDeadline := storage.deadlineFor("obj.manifest")
@@ -389,20 +441,4 @@ func Test_SaveManifestSidecar_WhenManifestIsLarge_ExtendsDeadlineBeyondFloor(t *
 	assert.Greater(t, time.Until(deadline), manifestSaveMinTimeout,
 		"a manifest past the floor's throughput budget must get more time")
 	assert.Len(t, storage.saved["obj.manifest"], len(largeManifest))
-}
-
-func Test_IsCompressionUnsupportedError_MatchesBuildRejection(t *testing.T) {
-	cases := []struct {
-		stderr   string
-		expected bool
-	}{
-		{"pg_basebackup: error: zstd compression is not supported by this build", true},
-		{"pg_basebackup: error: gzip compression is not supported by this build", true},
-		{"pg_basebackup: error: could not connect to server", false},
-		{"", false},
-	}
-
-	for _, testCase := range cases {
-		assert.Equal(t, testCase.expected, isCompressionUnsupportedError([]byte(testCase.stderr)), testCase.stderr)
-	}
 }
