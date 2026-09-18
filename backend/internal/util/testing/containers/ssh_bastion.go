@@ -2,6 +2,7 @@ package containers
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -23,6 +24,8 @@ const (
 )
 
 const sshBastionPort = "22/tcp"
+
+const sshBannerPrefix = "SSH-2.0-"
 
 // The image is built from contextDir rather than pulled because the stock openssh images disagree
 // on whether AllowTcpForwarding defaults to yes, and the baked-in authorized_keys has to match the
@@ -207,6 +210,70 @@ func sshBastionRequest(t *testing.T) testcontainers.ContainerRequest {
 			KeepImage:  true,
 		},
 		ExposedPorts: []string{sshBastionPort},
-		WaitingFor:   wait.ForListeningPort(sshBastionPort).WithStartupTimeout(120 * time.Second),
+		WaitingFor:   sshBastionReady(),
 	}
+}
+
+// wait.ForListeningPort alone is not enough here: docker-proxy accepts TCP before sshd finishes
+// its own startup, the same race already fixed for the MySQL family in mysql.go. That surfaces
+// as an EOF on the first real connection rather than a refused one. Reading the SSH banner proves
+// sshd itself, not just the port, is ready.
+func sshBastionReady() wait.Strategy {
+	return &waitForSSHBanner{
+		port:           sshBastionPort,
+		startupTimeout: 120 * time.Second,
+		pollInterval:   200 * time.Millisecond,
+	}
+}
+
+type waitForSSHBanner struct {
+	port           string
+	startupTimeout time.Duration
+	pollInterval   time.Duration
+}
+
+func (w *waitForSSHBanner) WaitUntilReady(ctx context.Context, target wait.StrategyTarget) error {
+	ctx, cancel := context.WithTimeout(ctx, w.startupTimeout)
+	defer cancel()
+
+	host, err := target.Host(ctx)
+	if err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(w.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			mappedPort, err := target.MappedPort(ctx, w.port)
+			if err != nil {
+				continue
+			}
+
+			if readSSHBanner(host, mappedPort.Port()) == nil {
+				return nil
+			}
+		}
+	}
+}
+
+func readSSHBanner(host, port string) error {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return err
+	}
+
+	banner := make([]byte, len(sshBannerPrefix))
+	_, err = io.ReadFull(conn, banner)
+
+	return err
 }
