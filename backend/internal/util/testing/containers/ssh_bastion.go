@@ -254,15 +254,17 @@ func (w *waitForSSHBanner) WaitUntilReady(ctx context.Context, target wait.Strat
 				continue
 			}
 
-			if readSSHBanner(host, mappedPort.Port()) == nil {
+			if readSSHBanner(ctx, host, mappedPort.Port()) == nil {
 				return nil
 			}
 		}
 	}
 }
 
-func readSSHBanner(host, port string) error {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+func readSSHBanner(ctx context.Context, host, port string) error {
+	dialer := net.Dialer{Timeout: 2 * time.Second}
+
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return err
 	}
